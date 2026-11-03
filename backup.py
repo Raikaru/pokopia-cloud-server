@@ -23,9 +23,11 @@ out; a listed file that is missing fails the backup, and so does a damaged game 
 It needs Python 3.8 or newer and only the standard library, plus ssh and rclone on PATH. To run it
 every 6 hours without a console window, enter this in cmd.exe, with PYTHONW replaced by the full
 path of the windowed interpreter (pythonw.exe) of the Python you have checked runs this script.
+The interactive task only runs while this user is logged in; Windows' default power settings also
+skip starts on battery and may stop a running backup if the PC switches to battery.
 Re-create the task with --profile portal once the portal is deployed.
 
-    schtasks /Create /TN "Pokopia VPS backup" /SC HOURLY /MO 6 /F /TR "\"PYTHONW\" \"C:\Users\thele\Projects\pokopia-cloud-release\backup.py\" --profile private-test"
+    schtasks /Create /TN "Pokopia VPS backup" /SC HOURLY /MO 6 /IT /F /TR "\"PYTHONW\" \"C:\Users\thele\Projects\pokopia-cloud-release\backup.py\" --profile private-test"
 
 Results go to backup.log next to this file. To restore, copy a backup to the VPS without writing it
 to this disk, again in cmd.exe, then follow the Backups section of pokopia-cloud-release/README.md:
