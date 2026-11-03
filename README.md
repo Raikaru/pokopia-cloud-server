@@ -326,7 +326,8 @@ Use [client-certificate mode](#accounts-passkeys-and-the-launcher). Without it, 
 
 ## Accounts, passkeys and the launcher
 
-None of this has been tested with the game yet.
+An isolated local smoke test registered a passkey, linked a launcher, issued a gRPC token through
+its mTLS gateway, and rejected the revoked device. None of this has been tested with the game yet.
 
 Client-certificate mode lets strangers play on an internet server. It has three parts:
 
