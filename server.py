@@ -85,7 +85,7 @@ import time
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Callable
+from typing import AsyncIterator, BinaryIO, Callable, Iterable
 from urllib.parse import quote, urlsplit
 
 try:
@@ -145,10 +145,12 @@ USER_DOCUMENT = re.compile(r"(tenants/[^/]+)/documents/users/([^/]+)/(public|pri
 MAX_GRPC_MESSAGE_BYTES = 4 * 1024 * 1024  # one gRPC message after decompression (gRPC's default)
 MAX_STORAGE_REQUEST_BYTES = 32 * 1024 * 1024  # the body of one storage request
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024  # one uploaded object
-MAX_CONNECTION_BUFFER_BYTES = 48 * 1024 * 1024  # request bodies one connection is receiving
-MAX_BUFFERED_BYTES = 256 * 1024 * 1024  # request bodies all connections are receiving
-MAX_BIDI_CALLS_PER_CONNECTION = 8  # each buffers up to one gRPC message; the game opens one
+# Request data one connection holds: bodies, bidirectional calls' queued messages, parsed messages.
+MAX_CONNECTION_BUFFER_BYTES = 48 * 1024 * 1024
+MAX_BUFFERED_BYTES = 256 * 1024 * 1024  # the same across all connections
+MAX_BIDI_CALLS_PER_CONNECTION = 8  # the game opens one
 MAX_INBOUND_QUEUE_BYTES = 8 * 1024 * 1024  # decoded messages a bidirectional call has not read yet
+INBOUND_MESSAGE_OVERHEAD = 64  # queue entry and bytes-object overhead, including empty messages
 MAX_MESSAGE_FIELDS = 65536  # fields of one decoded protobuf message; a nested message is its own
 # What a parsed protobuf message (Msg) counts against the request budgets while anything holds it:
 # MSG_BASE_BYTES, its size (the values are copies) and MSG_FIELD_BYTES per field, which covers the
@@ -348,7 +350,8 @@ def encode(*fields: tuple[int, object]) -> bytes:
 
 # The connection (H2Session) whose call the current task is handling, set by Server.handle_grpc
 # and inherited by tasks the handler starts. Messages parsed meanwhile count against its request
-# budgets (Msg). None elsewhere: at startup, in tests and in background tasks.
+# budgets (Msg). None elsewhere: at startup, in tests, in background tasks and while deferred
+# Gamesync writes are applied (Backend.gamesync_fire_deferments).
 request_budget: contextvars.ContextVar[H2Session | None] = contextvars.ContextVar("request_budget", default=None)
 
 
@@ -485,18 +488,22 @@ def _printable(value: bytes) -> str | None:
 
 
 def dump(buf: bytes, depth: int = 0) -> str:
-    """Renders a payload as an indented field tree for logs."""
+    """Renders a payload as an indented field tree for logs. What it parses counts against the
+    request budgets like any message (Msg), a message for as long as its nested fields are being
+    rendered; a payload or field that does not parse or would not fit is shown as bytes instead,
+    so logging never changes how a call is answered."""
     lines: list[str] = []
     try:
         _dump_into(buf, depth, lines)
-    except ValueError:
+    except (ValueError, GrpcError):
         return f"{'  ' * depth}<{len(buf)} bytes> {buf[:64].hex()}"
     return "\n".join(lines) if lines else f"{'  ' * depth}<empty>"
 
 
 def _dump_into(buf: bytes, depth: int, lines: list[str]) -> None:
     pad = "  " * depth
-    for number, values in Msg(buf).fields.items():
+    message = Msg(buf)  # held, so the nested fields parsed below count on top of it
+    for number, values in message.fields.items():
         for wire, value in values:
             if wire != 2:
                 lines.append(f"{pad}{number}: {value}")
@@ -510,7 +517,7 @@ def _dump_into(buf: bytes, depth: int, lines: list[str]) -> None:
                 if depth >= 16:
                     raise ValueError("too deep")
                 _dump_into(value, depth + 1, nested)
-            except ValueError:
+            except (ValueError, GrpcError):
                 lines.append(f"{pad}{number}: <{len(value)} bytes> {value[:64].hex()}")
                 continue
             lines += [f"{pad}{number} {{", *nested, f"{pad}}}"]
@@ -962,6 +969,8 @@ class Store:
         self.documents: dict[str, dict] = state.get("documents", {})
         self.aliases: dict[str, dict] = state.get("aliases", {})
         self.uploads: dict[str, dict] = state.get("uploads", {})
+        for upload_id, upload in self.uploads.items():
+            upload.setdefault("blob", upload_id)
         self.save()
 
     def state_json(self) -> str:
@@ -990,7 +999,7 @@ class Store:
         directory or full syncs), the file is kept: after a power loss the previous state, which may
         still refer to it, can come back. Kept files, and a file Windows refuses to delete while a
         download still has it open, are unreferenced orphans, as after a crash."""
-        if blob_id in self.uploads:
+        if any(upload["blob"] == blob_id for upload in self.uploads.values()):
             return
         for doc in self.documents.values():
             if (doc.get("attachment") or {}).get("blob") == blob_id:
@@ -1026,8 +1035,9 @@ class Store:
         """
         state = self.state_json().encode()
         recorded: dict[str, set[int]] = {}  # the sizes the state records for each blob
-        for upload_id, upload in self.uploads.items():
-            recorded.setdefault(upload_id, set()).add(upload["received"])
+        upload_sizes = {upload["blob"]: upload["received"] for upload in self.uploads.values()}
+        for blob_id, received in upload_sizes.items():
+            recorded.setdefault(blob_id, set()).add(received)
         for doc in self.documents.values():
             if attachment := doc.get("attachment"):
                 recorded.setdefault(attachment["blob"], set()).add(attachment["size"])
@@ -1042,10 +1052,10 @@ class Store:
             blobs = []
             for blob_id, fd in fds.items():
                 actual = size = os.fstat(fd).st_size
-                if blob_id in self.uploads:
+                if blob_id in upload_sizes:
                     # An upload may hold more than it has received if the server stopped before it
                     # saved, and it rewrites those bytes when the upload goes on.
-                    size = min(size, self.uploads[blob_id]["received"])
+                    size = min(size, upload_sizes[blob_id])
                 if recorded[blob_id] != {size}:
                     damaged.append(f"{blob_id} has {actual} bytes, but the state records {sorted(recorded[blob_id])}")
                 blobs.append((blob_id, fd, size))
@@ -1255,11 +1265,11 @@ class Storage:
             owned = sorted((upload["create_time"], upload_id) for upload_id, upload in self.store.uploads.items()
                            if upload.get("owner") == owner)
             for _, stale in owned[: max(0, len(owned) - MAX_UPLOADS_PER_ACCOUNT + 1)]:
-                del self.store.uploads[stale]
-                stale_uploads.append(stale)
+                stale_uploads.append(self.store.uploads.pop(stale)["blob"])
         upload_id = random_id()
         self.store.write_blob(upload_id, b"")
         self.store.uploads[upload_id] = {
+            "blob": upload_id,
             "received": 0,
             "total": None,
             "complete": False,
@@ -1307,18 +1317,24 @@ class Storage:
         if content_range is None:
             if (refused := self.refuse_upload(upload_id, upload, len(body))) is not None:
                 return refused
-            if upload["received"]:
-                # write_blob can fail after its rename has replaced the file (a failed directory
-                # sync), leaving fewer bytes than were counted, so the count goes to zero first,
-                # durably. Never in place: a snapshot may be reading the old file up to the old
-                # count, so the upload gets a new, empty file before its count goes down. If that
-                # write fails after its rename, the file is shorter than the count and the next
-                # chunk discards the upload (410).
-                self.store.write_blob(upload_id, b"")
-                upload["received"] = 0
+            # Publish a new backing file before changing the session. The old file and its
+            # acknowledged progress remain intact through an interrupted replacement.
+            replacement = random_id()
+            while self.store.blob_path(replacement).exists():
+                replacement = random_id()
+            if not write_durably(self.store.blob_path(replacement), body):
+                raise OSError("cannot durably publish replacement upload")
+            self.store.uploads[upload_id] = {
+                **upload, "blob": replacement, "received": len(body), "total": len(body), "complete": True,
+            }
+            try:
                 self.store.save()
-            self.store.write_blob(upload_id, body)
-            upload["received"] = upload["total"] = len(body)
+            except BaseException:
+                # A failed directory sync may have published the new state. Keep both files.
+                self.store.uploads[upload_id] = upload
+                raise
+            self.store.release_blob(upload["blob"])
+            return self.upload_finished(upload_id, self.store.uploads[upload_id])
         else:
             match = CONTENT_RANGE.fullmatch(content_range.strip())
             if match is None:
@@ -1338,7 +1354,7 @@ class Storage:
                     if (refused := self.refuse_upload(upload_id, upload, max(received, last + 1))) is not None:
                         return refused
                     try:
-                        blob = self.store.blob_path(upload_id).open("r+b")
+                        blob = self.store.blob_path(upload["blob"]).open("r+b")
                     except FileNotFoundError:
                         return self.discard_upload(upload_id, 410, "the upload's data is missing; start again")
                     with blob:
@@ -1375,9 +1391,9 @@ class Storage:
         return None if problem is None else self.discard_upload(upload_id, 507, problem)
 
     def discard_upload(self, upload_id: str, status: int, reason: str) -> Response:
-        del self.store.uploads[upload_id]
+        blob_id = self.store.uploads.pop(upload_id)["blob"]
         self.store.save()
-        self.store.release_blob(upload_id)
+        self.store.release_blob(blob_id)
         log.warning("discarded upload %s: %s", upload_id, reason)
         return response(status, f"{reason}\n".encode())
 
@@ -1412,7 +1428,7 @@ class Storage:
         if upload is not None and not upload["complete"]:
             return response(404, b"no such object\n")
         try:
-            file = self.store.blob_path(blob_id).open("rb")
+            file = self.store.blob_path(upload["blob"] if upload is not None else blob_id).open("rb")
         except OSError:
             return response(404, b"no such object\n")
         size = os.fstat(file.fileno()).st_size
@@ -1482,20 +1498,32 @@ class GamesyncSpace:
         self.globals: dict[str, bytes] = {}
         # transaction -> (begin time, update_time of every document read in it; None if missing)
         self.transactions: dict[bytes, tuple[float, dict[str, int | None]]] = {}
-        # deferment name -> (owning user session, call that stored it, deferred WriteOperations)
-        self.deferments: dict[str, tuple[str, Call, list[bytes]]] = {}
+        # deferment name -> (owning user session, what resolves its names (deferment_call), the
+        # Deferment message as received, whose field 2 holds its WriteOperations). It stays encoded
+        # until it is applied, so it holds the bytes it counts (gamesync_size) and no list per write.
+        self.deferments: dict[str, tuple[str, Call, bytes]] = {}
         self.watchers: set[GamesyncWatcher] = set()
         self.sequence = itertools.count(1)  # ussid and ucsid of docs/__us documents
 
 
+def deferment_call(call: Call) -> Call:
+    """What a deferment keeps of the call that stored it: the metadata and account Backend.resolve
+    reads, so its writes resolve their names as that call would, without holding the rest of the
+    call's headers for as long as it waits."""
+    metadata = {key: call.metadata[key] for key in ("npln-tenant-id", "authorization") if key in call.metadata}
+    return Call("", metadata, call.principal)
+
+
 def gamesync_size(docs: dict[str, dict | None], globals_: dict[str, bytes],
-                  deferments: dict[str, tuple[str, Call, list[bytes]]]) -> tuple[int, int]:
+                  deferments: dict[str, tuple[str, Call, bytes]]) -> tuple[int, int]:
     """(bytes, records) of a game session's Gamesync documents, global values and deferred writes,
-    names and per-record overhead included; documents staged as deleted (None) do not count."""
+    names and per-record overhead included; documents staged as deleted (None) do not count. A
+    deferment counts its encoded Deferment message, field keys and lengths included, so an empty
+    write still costs what it holds, and the metadata it keeps (deferment_call)."""
     size = sum(len(name) + len(doc["fields"]) + STATE_OVERHEAD_BYTES for name, doc in docs.items() if doc is not None)
     size += sum(len(key) + len(value) + STATE_OVERHEAD_BYTES for key, value in globals_.items())
-    size += sum(len(name) + sum(map(len, writes)) + STATE_OVERHEAD_BYTES
-                for name, (_, _, writes) in deferments.items())
+    size += sum(len(name) + len(deferment) + sum(map(len, call.metadata.values())) + STATE_OVERHEAD_BYTES
+                for name, (_, call, deferment) in deferments.items())
     return size, sum(1 for doc in docs.values() if doc is not None) + len(globals_) + len(deferments)
 
 
@@ -2089,12 +2117,11 @@ class Backend:
         uploads = [upload_id for upload_id, upload in self.store.uploads.items()
                    if upload.get("owner") == account]
         blobs = self.delete_users(users)
-        for upload_id in uploads:
-            del self.store.uploads[upload_id]
+        upload_blobs = [self.store.uploads.pop(upload_id)["blob"] for upload_id in uploads]
         self.password_grants = {key: grant for key, grant in self.password_grants.items() if key[0] != account}
         self.guesses.forget(account)
         self.store.save()
-        self.release_blobs([*blobs, *uploads])
+        self.release_blobs([*blobs, *upload_blobs])
         log.info("purged deleted account %s: %d user(s), %d attachment(s), %d upload session(s)",
                  account, len(users), len(blobs), len(uploads))
 
@@ -2128,13 +2155,12 @@ class Backend:
                 self.store.documents.pop(name, None)
             else:
                 self.store.documents[name] = doc
-        for upload_id in staging.imported_uploads:
-            self.store.uploads.pop(upload_id, None)
+        imported_blobs = [self.store.uploads.pop(upload_id)["blob"] for upload_id in staging.imported_uploads]
         self.store.save()
         # Files go after the save (release_blobs). An imported upload that the commit's final
         # documents no longer refer to (imported, then deleted or replaced in the same commit) goes
         # too, so no file outlives its record.
-        self.release_blobs(replaced_blobs.union(staging.new_blobs, staging.imported_uploads))
+        self.release_blobs(replaced_blobs.union(staging.new_blobs, imported_blobs))
         log.info("committed %d write(s): %s", len(results), ", ".join(staging.changes) or "-")
         return encode(*[(1, result) for result in results], (2, timestamp(now)))
 
@@ -2229,13 +2255,13 @@ class Backend:
             if upload_id in staging.imported_uploads:
                 raise GrpcError(INVALID_ARGUMENT, f"upload {uri} is imported twice")
             try:
-                intact = self.store.blob_path(upload_id).stat().st_size == upload["received"]
+                intact = self.store.blob_path(upload["blob"]).stat().st_size == upload["received"]
             except FileNotFoundError:
                 intact = False
             if not intact:
                 raise GrpcError(FAILED_PRECONDITION, f"upload {uri} is damaged; upload it again")
             staging.imported_uploads.append(upload_id)
-            attachment = {"blob": upload_id, "mime_type": imported.get_str(3),
+            attachment = {"blob": upload["blob"], "mime_type": imported.get_str(3),
                           "size": upload["received"]}
             staging.put(name, updated_document(staging.get(name), now, attachment=attachment))
             return written
@@ -2696,19 +2722,21 @@ class Backend:
         # Round's fields are undocumented; the created round is the requested one.
         return req.get_bytes(1) or b""
 
-    def gamesync_commit(self, space: GamesyncSpace, owner: str, call: Call, writes: list[Msg],
+    def gamesync_commit(self, space: GamesyncSpace, owner: str, call: Call, writes: Iterable[Msg],
                         deferments: list[Msg]) -> tuple[list[bytes], int]:
         """Applies WriteOperations and DefermentOperations atomically to one game session's gamesync
-        state and notifies its watchers. The deferments stored belong to user session `owner`."""
+        state and notifies its watchers. The deferments stored belong to user session `owner`.
+        `writes` are applied in order as they are taken, so they may be parsed one at a time."""
         now = time.time_ns()
         staging = Staging(space.docs)
         staged_globals = dict(space.globals)
         results = [self.gamesync_apply_write(call, op, staging, staged_globals, now) for op in writes]
         staged_deferments = dict(space.deferments)
+        kept = deferment_call(call) if deferments else call
         for op in deferments:
             if (update := op.get_msg(1)) is not None:
-                deferment = update.get_msg(1) or Msg()
-                staged_deferments[self.resolve(call, deferment.get_str(1))] = (owner, call, deferment.get_raws(2))
+                name = self.resolve(call, (update.get_msg(1) or Msg()).get_str(1))
+                staged_deferments[name] = (owner, kept, update.get_bytes(1) or b"")
             elif (delete := op.get_msg(2)) is not None:
                 staged_deferments.pop(self.resolve(call, delete.get_str(1)), None)
             else:
@@ -2865,17 +2893,31 @@ class Backend:
 
     def gamesync_fire_deferments(self, space: GamesyncSpace, user_session: str) -> None:
         """Applies the deferred writes of a user session whose KeepUserSession call ended or that
-        left its game session."""
-        for name, (owner, call, writes) in list(space.deferments.items()):
-            if owner != user_session:
-                continue
-            del space.deferments[name]
-            try:
-                self.gamesync_commit(space, owner, call, [Msg(write) for write in writes], [])
-            except (GrpcError, ValueError) as exc:
-                log.warning("deferment %s of %s failed: %s", name, user_session, exc)
-            else:
-                log.info("applied deferment %s of %s", name, user_session)
+        left its game session, one deferment and one write at a time.
+
+        They were admitted against the game session's Gamesync limit when they were stored, so
+        they are parsed outside the request budget of whichever call this runs in
+        (request_budget): request data that other calls hold, or that the ending call holds, must
+        not cost the game session writes it already accepted. That parsing is still bounded: a
+        deferment came in one gRPC message (MAX_GRPC_MESSAGE_BYTES), and the deferments are applied
+        without yielding, so no other one is parsed meanwhile. A deferment whose writes fail on
+        their own (malformed or empty, a failed precondition, the Gamesync limit) is logged and
+        dropped: its user session may be gone, so nothing would try it again."""
+        token = request_budget.set(None)
+        try:
+            for name, (owner, call, deferment) in list(space.deferments.items()):
+                if owner != user_session:
+                    continue
+                del space.deferments[name]
+                try:
+                    writes = (Msg(write) for write in Msg(deferment).get_raws(2))
+                    self.gamesync_commit(space, owner, call, writes, [])
+                except (GrpcError, ValueError) as exc:
+                    log.warning("deferment %s of %s failed: %s", name, user_session, exc)
+                else:
+                    log.info("applied deferment %s of %s", name, user_session)
+        finally:
+            request_budget.reset(token)
 
     async def keep_user_session(self, call: Call, requests: AsyncIterator[Msg]) -> AsyncIterator[bytes]:
         try:
@@ -3014,26 +3056,26 @@ def single_grpc_message(body: bytes, encoding: str) -> bytes:
 
 class GrpcInbound:
     """The request messages of a bidirectional call, delivered as they arrive. Bytes still being
-    decoded and decoded messages not yet read count towards Server.buffered; once more than
-    MAX_INBOUND_QUEUE_BYTES of them wait, the call fails, and once it is over (discard) nothing more
-    is kept. A message read (messages) counts as a parsed Msg from then on, for as long as anything
-    holds it."""
+    decoded and decoded messages not yet read count against the connection's request budgets, its
+    own and all connections' (H2Session.count). Once more than MAX_INBOUND_QUEUE_BYTES of them
+    wait, the call fails, and so it does with RESOURCE_EXHAUSTED once decoding (decompression)
+    would take the budgets past their limits; once it is over (discard) nothing more is kept. A
+    message read (messages) counts as a parsed Msg from then on, for as long as anything holds it."""
 
-    def __init__(self, encoding: str, server: Server | None = None):
+    def __init__(self, encoding: str, session: H2Session):
         self.encoding = encoding
-        self.server = server
+        self.session = session
         self.buffer = bytearray()
         self.queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue()
-        self.queued = 0  # bytes of decoded messages in the queue
+        self.queued = 0  # decoded messages and their per-entry overhead
         self.failed = False
 
     def size(self) -> int:
         return len(self.buffer) + self.queued
 
     def counted(self, before: int) -> None:
-        """Moves Server.buffered by how much this call's size changed since it was `before`."""
-        if self.server is not None:
-            self.server.buffered += self.size() - before
+        """Moves the connection's budgets by how much this call's size changed since it was `before`."""
+        self.session.count(self.size() - before)
 
     def fail(self, error: Exception) -> None:
         self.failed = True
@@ -3044,17 +3086,27 @@ class GrpcInbound:
         self.queue.put_nowait(error)
 
     def feed(self, data: bytes) -> None:
+        """Takes a piece of the call's request data, which on_event has made sure fits the budgets,
+        and queues the messages it completes, decoded."""
         if self.failed:
             return
         before = self.size()
+        room = self.session.request_room()  # how much this call's size may grow by
         self.buffer += data
         try:
-            # What one batch decodes is bounded by the room left in the queue, not only per message.
-            for message in take_grpc_frames(self.buffer, self.encoding, MAX_INBOUND_QUEUE_BYTES - self.queued):
-                self.queue.put_nowait(message)
-                self.queued += len(message)
-            if self.size() > MAX_INBOUND_QUEUE_BYTES:
+            # What one batch decodes is bounded by the room left in the queue, not only per message,
+            # and is checked against the budgets before any of it is queued or counted.
+            messages = take_grpc_frames(self.buffer, self.encoding, MAX_INBOUND_QUEUE_BYTES - self.queued)
+            held = self.size() + sum(len(message) + INBOUND_MESSAGE_OVERHEAD for message in messages)
+            if held > MAX_INBOUND_QUEUE_BYTES:
                 raise ValueError("too many request messages wait to be read")
+            if held - before > room:
+                raise GrpcError(RESOURCE_EXHAUSTED, "too much request data in flight")
+            for message in messages:
+                self.queue.put_nowait(message)
+                self.queued += len(message) + INBOUND_MESSAGE_OVERHEAD
+        except GrpcError as exc:
+            self.fail(exc)
         except (ValueError, zlib.error) as exc:
             self.fail(ValueError(f"malformed request: {exc}"))
         self.counted(before)
@@ -3078,7 +3130,7 @@ class GrpcInbound:
             if isinstance(item, Exception):
                 raise item
             before = self.size()
-            self.queued -= len(item)
+            self.queued -= len(item) + INBOUND_MESSAGE_OVERHEAD
             self.counted(before)
             if log.isEnabledFor(logging.DEBUG):
                 log.debug("stream request:\n%s", dump(item, 1))
@@ -3126,7 +3178,9 @@ class H2Session:
         self.window_waiters: list[asyncio.Future] = []
         self.closed = False
         self.principal = principal  # the connection's account in client-certificate mode
-        self.buffered = 0  # request bodies held (take_body_data) and parsed messages held (Msg)
+        # Request data held: bodies (take_body_data), bidirectional calls' queued data (GrpcInbound)
+        # and parsed messages (Msg).
+        self.buffered = 0
         self.overloaded = ""  # why the connection is being closed for breaking a limit
         self.pending = 0  # response bytes handed to send_data and not yet sent; see send_data
         self.downloads = 0  # storage downloads being sent; see send_file
@@ -3267,11 +3321,11 @@ class H2Session:
             if (headers.get("content-type", "").startswith("application/grpc")
                     and headers.get(":path") in self.server.backend.bidi):
                 # Bidirectional calls start right away and receive their requests as they arrive.
-                # Each buffers up to one gRPC message, so a connection may only hold a few.
+                # What each holds counts against the connection's request budgets (GrpcInbound).
                 if len(self.inbound) >= MAX_BIDI_CALLS_PER_CONNECTION:
                     self.overloaded = "too many bidirectional calls"
                     return
-                inbound = GrpcInbound(headers.get("grpc-encoding", "identity"), self.server)
+                inbound = GrpcInbound(headers.get("grpc-encoding", "identity"), self)
                 self.inbound[event.stream_id] = inbound
                 task = asyncio.create_task(self.dispatch(event.stream_id, headers, inbound))
                 # A done callback runs even for a task cancelled before it started, which skips
@@ -3282,7 +3336,8 @@ class H2Session:
                 self.requests[event.stream_id] = (headers, bytearray())
         elif isinstance(event, h2.events.DataReceived):
             if inbound := self.inbound.get(event.stream_id):
-                if self.server.buffered + len(event.data) > MAX_BUFFERED_BYTES:
+                # Data a failed call ignores is not held; see GrpcInbound.feed for what decoding adds.
+                if not inbound.failed and len(event.data) > self.request_room():
                     self.overloaded = "too much request data in flight"
                     return
                 inbound.feed(event.data)
@@ -3315,10 +3370,10 @@ class H2Session:
 
     def take_body_data(self, request: tuple[dict[str, str], bytearray], data: bytes) -> None:
         """Buffers data of a request body unless that would break a limit: one gRPC message
-        (MAX_GRPC_MESSAGE_BYTES) or MAX_STORAGE_REQUEST_BYTES per request, and
-        MAX_CONNECTION_BUFFER_BYTES per connection of bodies arriving or whose call is not over
-        yet, and MAX_BUFFERED_BYTES across connections of those and of bidirectional calls' unread
-        messages (GrpcInbound). Breaking one closes the connection (run)."""
+        (MAX_GRPC_MESSAGE_BYTES) or MAX_STORAGE_REQUEST_BYTES per request, and the request budgets,
+        MAX_CONNECTION_BUFFER_BYTES per connection and MAX_BUFFERED_BYTES across connections, of
+        bodies arriving or whose call is not over yet, bidirectional calls' queued data (GrpcInbound)
+        and parsed messages (Msg). Breaking one closes the connection (run)."""
         headers, body = request
         grpc = headers.get("content-type", "").startswith("application/grpc")
         if len(body) + len(data) > (MAX_GRPC_MESSAGE_BYTES + 5 if grpc else MAX_STORAGE_REQUEST_BYTES):
@@ -3349,7 +3404,8 @@ class H2Session:
         return min(MAX_CONNECTION_BUFFER_BYTES - self.buffered, MAX_BUFFERED_BYTES - self.server.buffered)
 
     def count(self, size: int) -> None:
-        """Request data of `size` bytes is held: a parsed message (Msg)."""
+        """Request data of `size` bytes is held: a parsed message (Msg), or what a bidirectional
+        call holds grew (GrpcInbound; negative when it shrank)."""
         self.buffered += size
         self.server.buffered += size
 
