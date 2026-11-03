@@ -1,0 +1,30 @@
+# Private keys, certificates, CSRs and CA serials. Every operator generates their own (README).
+*.key
+*.pem
+*.crt
+*.cer
+*.der
+*.csr
+*.srl
+*.p12
+*.pfx
+
+# Server state: user records, documents, the token-signing secret and uploaded island blobs.
+data/
+*.tmp
+
+# Portal account database: accounts, passkeys, linked launchers and sessions.
+*.db
+*.db-journal
+
+# Backup snapshots (snapshot.py): the same server state, plus any keys added with --dir.
+*.tar.gz
+
+# Logs: user and tenant ids, peer addresses and, with -v, full payloads including tokens.
+*.log
+
+# Python caches and virtual environments.
+__pycache__/
+*.py[cod]
+.venv/
+venv/

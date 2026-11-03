@@ -1,0 +1,23 @@
+
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt = no
+
+[req_distinguished_name]
+CN = *.lp1.t.npln.srv.nintendo.net
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth,clientAuth
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = *.npln.nintendo.net
+DNS.2 = npln.nintendo.net
+DNS.3 = *.npln.srv.nintendo.net
+DNS.4 = *.t.npln.srv.nintendo.net
+DNS.5 = *.lp1.t.npln.srv.nintendo.net
+DNS.6 = localhost
+IP.1 = 127.0.0.1
