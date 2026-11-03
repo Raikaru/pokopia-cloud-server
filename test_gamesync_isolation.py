@@ -1,6 +1,7 @@
-"""Regression test: game sessions open at the same time keep their Gamesync state apart.
+"""Regression tests: game sessions open at the same time keep their Gamesync state apart, and
+deferred writes stay within the Gamesync limit and are applied under request memory pressure.
 
-Run it from this directory with the dependencies installed:
+Run them from this directory with the dependencies installed:
 
     python -m unittest test_gamesync_isolation
 """
@@ -8,10 +9,14 @@ Run it from this directory with the dependencies installed:
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import secrets
 import tempfile
+import tracemalloc
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import server
 from server import Msg, encode
@@ -37,6 +42,29 @@ def text(value: str) -> bytes:
 def update(name: str, fields: dict[str, bytes]) -> bytes:
     """A WriteOperation that replaces a document."""
     return encode((1, encode((1, encode((1, name), (2, server.encode_map(fields)))))))
+
+
+def defer(deferment: bytes) -> bytes:
+    """A WriteDocumentsRequest that stores a Deferment."""
+    return encode((2, encode((1, encode((1, deferment))))))
+
+
+class Budget:
+    """Stands in for a connection's request budgets (server.request_budget): parsed messages may
+    hold `room` bytes."""
+
+    def __init__(self) -> None:
+        self.room = 1 << 30
+        self.held = 0
+
+    def request_room(self) -> int:
+        return self.room - self.held
+
+    def count(self, size: int) -> None:
+        self.held += size
+
+    def uncount(self, size: int) -> None:
+        self.held -= size
 
 
 def gamesync_token(backend: server.Backend, session_id: str, matchmaking_token: str) -> str:
@@ -240,6 +268,64 @@ class GamesyncIsolationTest(unittest.TestCase):
         await watch_a.close()
         self.assertIsNone(watch_a.error)
         self.assertTrue(all(watch.task.done() for watch in (watch_a, watch_guest, watch_b, anonymous)))
+
+    def test_deferments_hold_what_they_count(self) -> None:
+        # Deferments stay within the game session's Gamesync limit however they are made up: empty
+        # writes cost the bytes they take, and the headers of the calls that stored them are let go.
+        limit = 128 * 1024
+        session, player = host(self.backend, "u-host")
+        refused = 0
+        with mock.patch.object(server, "MAX_GAMESYNC_BYTES", limit):
+            gc.collect()
+            tracemalloc.start()
+            try:
+                for i in range(32):
+                    padded = server.Call("", {**player.call.metadata, "x-padding": secrets.token_hex(8192)})
+                    deferment = encode((1, f"userSessions/current/deferments/d{i}"), *[(2, b"")] * 4000)
+                    try:
+                        self.backend.gamesync_write_documents(padded, Msg(defer(deferment)))
+                    except server.GrpcError as exc:
+                        self.assertEqual(exc.code, server.RESOURCE_EXHAUSTED)
+                        refused += 1
+                    del padded
+                gc.collect()
+                held = tracemalloc.get_traced_memory()[0]
+            finally:
+                tracemalloc.stop()
+        self.assertGreater(refused, 0)
+        self.assertEqual(len(session.gamesync.deferments), 32 - refused)
+        self.assertLess(held, 2 * limit)
+
+    def test_deferred_writes_survive_request_pressure(self) -> None:
+        asyncio.run(self.deferred_writes_survive_request_pressure())
+
+    async def deferred_writes_survive_request_pressure(self) -> None:
+        # Request data that other calls hold does not cost a player the deferred writes the game
+        # session already accepted from it.
+        backend = self.backend
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        watch_host = Watch(backend, host_player.call, "docs/__stg/All")
+        budget = Budget()
+        token = server.request_budget.set(budget)
+        try:
+            watch_guest = Watch(backend, guest.call, "docs/__stg/All")  # handled under `budget`
+        finally:
+            server.request_budget.reset(token)
+        await settle()
+        deferment = encode((1, "userSessions/current/deferments/leave"),
+                           (2, update("docs/__stg/All", {"pl": text("left")})))
+        backend.gamesync_write_documents(guest.call, Msg(defer(deferment)))
+        self.assertEqual(len(island.gamesync.deferments), 1)
+
+        budget.room = 0  # by the time the guest's call ends, other calls hold all request memory
+        await watch_guest.close()
+        self.assertIsNone(watch_guest.error)
+        self.assertEqual(island.gamesync.deferments, {})
+        self.assertEqual(read_text(backend, host_player, "docs/__stg/All"), "left")
+        self.assertEqual(watch_host.texts("docs/__stg/All"), ["left"])
+        await watch_host.close()
+        self.assertIsNone(watch_host.error)
 
 
 if __name__ == "__main__":

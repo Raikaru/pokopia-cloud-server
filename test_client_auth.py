@@ -24,6 +24,7 @@ from unittest import mock
 
 import h2.config
 import h2.connection
+import h2.events
 
 import server
 from server import Msg, encode
@@ -202,31 +203,34 @@ class ClientAuthTest(unittest.TestCase):
 
     def test_imported_upload_left_unreferenced_is_deleted(self) -> None:
         upload_id = self.complete_upload()
+        blob_id = self.store.uploads[upload_id]["blob"]
         name = f"{self.host.documents}/private/Extra"
         self.host.commit(encode((5, encode((1, name), (2, f"https://storage.invalid/upload/{upload_id}")))),
                          encode((2, encode((1, name)))))
         self.assertNotIn(upload_id, self.store.uploads)
-        self.assertFalse(self.store.blob_path(upload_id).exists())
+        self.assertFalse(self.store.blob_path(blob_id).exists())
 
     def test_blob_outlives_a_failed_save(self) -> None:
         """Files are deleted only after the state that stops referring to them is saved."""
         upload_id = self.complete_upload()
+        blob_id = self.store.uploads[upload_id]["blob"]
         name = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((5, encode((1, name), (2, f"https://storage.invalid/upload/{upload_id}")))))
         with mock.patch.object(self.store, "save", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 self.host.commit(encode((4, encode((1, name)))))  # unset the attachment
-        self.assertTrue(self.store.blob_path(upload_id).exists())
+        self.assertTrue(self.store.blob_path(blob_id).exists())
 
     def test_blob_outlives_a_failed_sync(self) -> None:
         """A save that cannot reach storage fails before the old file goes."""
         upload_id = self.complete_upload()
+        blob_id = self.store.uploads[upload_id]["blob"]
         name = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((5, encode((1, name), (2, f"https://storage.invalid/upload/{upload_id}")))))
         with mock.patch.object(server, "sync_fd", side_effect=OSError("I/O error")):
             with self.assertRaises(OSError):
                 self.host.commit(encode((4, encode((1, name)))))
-        self.assertTrue(self.store.blob_path(upload_id).exists())
+        self.assertTrue(self.store.blob_path(blob_id).exists())
 
     def test_state_is_flushed_before_it_is_published(self) -> None:
         events: list[object] = []
@@ -275,12 +279,13 @@ class ClientAuthTest(unittest.TestCase):
 
     def test_blobs_stay_when_the_state_cannot_be_saved_durably(self) -> None:
         upload_id = self.complete_upload()
+        blob_id = self.store.uploads[upload_id]["blob"]
         name = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((5, encode((1, name), (2, f"https://storage.invalid/upload/{upload_id}")))))
         with mock.patch.object(server, "sync_fd", return_value=False):
             self.host.commit(encode((4, encode((1, name)))))
         self.assertFalse(self.store.durable)
-        self.assertTrue(self.store.blob_path(upload_id).exists())
+        self.assertTrue(self.store.blob_path(blob_id).exists())
 
     def put(self, upload_id: str, body: bytes, content_range: str | None = None) -> server.Response:
         headers = {"content-range": content_range} if content_range else {}
@@ -302,30 +307,48 @@ class ClientAuthTest(unittest.TestCase):
 
         return mock.patch.object(server, "publish", side_effect=fake)
 
-    def test_whole_upload_failing_after_its_rename_starts_over(self) -> None:
-        """The audit's case: a whole-object PUT replaces the file with three bytes, then its
-        directory sync fails. The session must not resume at byte 10 of the old upload."""
-        upload_id = self.storage.new_upload(self.host.principal.account)
-        self.assertEqual(self.put(upload_id, b"a" * 10, "bytes 0-9/20").status, 308)
-        with self.fail_blob_publish(2, after_rename=True):  # 1: the new empty file, 2: the body
-            with self.assertRaises(OSError):
-                self.put(upload_id, b"bbb")
-        resumed = self.put(upload_id, b"c" * 10, "bytes 10-19/20")
-        self.assertEqual(resumed.status, 308)
-        self.assertNotIn("range", dict(resumed.headers))  # start again from byte 0
-        self.assertFalse(self.store.uploads[upload_id]["complete"])
-        self.assertEqual(self.put(upload_id, b"d" * 20, "bytes 0-19/20").status, 200)
-        self.assertEqual(self.store.blob_path(upload_id).read_bytes(), b"d" * 20)
+    def test_failed_replacement_preserves_upload_and_backup(self) -> None:
+        for after_rename in (False, True):
+            with self.subTest(after_rename=after_rename):
+                upload_id = self.storage.new_upload(self.host.principal.account)
+                self.assertEqual(self.put(upload_id, b"a" * 10, "bytes 0-9/20").status, 308)
+                with self.fail_blob_publish(1, after_rename=after_rename):
+                    with self.assertRaises(OSError):
+                        self.put(upload_id, b"bbb")
+                reopened = server.Store(self.store.path.parent)
+                _, descriptors, damaged = reopened.snapshot()
+                for _, fd, _ in descriptors:
+                    os.close(fd)
+                self.assertEqual(damaged, [])
+                storage = server.Storage(reopened, "https://storage.invalid")
+                response = storage.handle("PUT", f"/upload/{upload_id}",
+                                          {"content-range": "bytes 10-19/20"},
+                                          b"c" * 10, self.host.principal)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(reopened.blob_path(reopened.uploads[upload_id]["blob"]).read_bytes(),
+                                 b"a" * 10 + b"c" * 10)
 
-    def test_whole_upload_failing_on_its_empty_file_is_discarded(self) -> None:
+    def test_replacement_state_save_failure_keeps_both_versions(self) -> None:
         upload_id = self.storage.new_upload(self.host.principal.account)
         self.put(upload_id, b"a" * 10, "bytes 0-9/20")
-        with self.fail_blob_publish(1, after_rename=True):
+        old_blob = self.store.uploads[upload_id]["blob"]
+        save = self.store.save
+
+        def fail_after_save():
+            save()
+            raise OSError(errno.EIO, "state sync failed")
+
+        with mock.patch.object(self.store, "save", side_effect=fail_after_save):
             with self.assertRaises(OSError):
                 self.put(upload_id, b"bbb")
-        # The file is empty, the count still 10: no gap gets filled in.
-        self.assertEqual(self.put(upload_id, b"c" * 10, "bytes 10-19/20").status, 410)
-        self.assertNotIn(upload_id, self.store.uploads)
+        self.assertEqual(self.store.uploads[upload_id]["blob"], old_blob)
+        self.assertEqual(self.store.blob_path(old_blob).read_bytes(), b"a" * 10)
+        reopened = server.Store(self.store.path.parent)
+        self.assertEqual(reopened.blob_path(reopened.uploads[upload_id]["blob"]).read_bytes(), b"bbb")
+        _, descriptors, damaged = reopened.snapshot()
+        for _, fd, _ in descriptors:
+            os.close(fd)
+        self.assertEqual(damaged, [])
 
     @unittest.skipUnless(os.name == "posix", "snapshots run on Linux; Windows cannot replace an open file")
     def test_whole_upload_never_rewrites_the_file_a_snapshot_reads(self) -> None:
@@ -333,12 +356,12 @@ class ClientAuthTest(unittest.TestCase):
         upload_id = self.storage.new_upload(self.host.principal.account)
         self.put(upload_id, b"a" * 10, "bytes 0-9/20")
         with self.store.blob_path(upload_id).open("rb") as captured:
-            with self.fail_blob_publish(2, after_rename=False):  # the body never lands
+            with self.fail_blob_publish(1, after_rename=False):
                 with self.assertRaises(OSError):
                     self.put(upload_id, b"bbb")
-            self.assertEqual(self.put(upload_id, b"e" * 20, "bytes 0-19/20").status, 200)
+            self.assertEqual(self.put(upload_id, b"e" * 20).status, 200)
             self.assertEqual(captured.read(), b"a" * 10)
-        self.assertEqual(self.store.blob_path(upload_id).read_bytes(), b"e" * 20)
+        self.assertEqual(self.store.blob_path(self.store.uploads[upload_id]["blob"]).read_bytes(), b"e" * 20)
 
     def test_upload_shorter_than_received_is_discarded(self) -> None:
         upload_id = self.storage.new_upload(self.host.principal.account)
@@ -358,7 +381,7 @@ class ClientAuthTest(unittest.TestCase):
 
     def test_damaged_upload_is_not_imported(self) -> None:
         upload_id = self.complete_upload()
-        with self.store.blob_path(upload_id).open("r+b") as blob:
+        with self.store.blob_path(self.store.uploads[upload_id]["blob"]).open("r+b") as blob:
             blob.truncate(2)
         name = f"{self.host.documents}/private/StageData"
         self.assert_status(server.FAILED_PRECONDITION, self.host.commit,
@@ -511,18 +534,29 @@ class LimitsTest(unittest.TestCase):
         self.assertIn(("target", "island x"), limiter.buckets(call, "island x", "v2"))
 
     def test_inbound_queue_is_bounded_and_released(self) -> None:
-        budget = types.SimpleNamespace(buffered=0)
-        inbound = server.GrpcInbound("identity", budget)
+        session = server.H2Session(types.SimpleNamespace(buffered=0), None, FakeWriter())
+        inbound = server.GrpcInbound("identity", session)
         message = b"\0" * 1024 * 1024
         frame = b"\x00" + len(message).to_bytes(4, "big") + message
-        for _ in range(server.MAX_INBOUND_QUEUE_BYTES // len(message)):
+        for _ in range(server.MAX_INBOUND_QUEUE_BYTES // (len(message) + server.INBOUND_MESSAGE_OVERHEAD)):
             inbound.feed(frame)
         self.assertFalse(inbound.failed)
-        self.assertEqual(budget.buffered, inbound.size())
+        self.assertEqual((session.server.buffered, session.buffered), (inbound.size(), inbound.size()))
         inbound.feed(frame)
         self.assertTrue(inbound.failed)
         inbound.discard()
-        self.assertEqual(budget.buffered, 0)
+        self.assertEqual((session.server.buffered, session.buffered), (0, 0))
+
+    def test_empty_bidi_messages_cannot_bypass_queue_limit(self) -> None:
+        session = server.H2Session(types.SimpleNamespace(buffered=0), None, FakeWriter())
+        inbound = server.GrpcInbound("identity", session)
+        with mock.patch.object(server, "MAX_INBOUND_QUEUE_BYTES", 2 * server.INBOUND_MESSAGE_OVERHEAD):
+            inbound.feed(b"\0" * 5)
+            inbound.feed(b"\0" * 5)
+            self.assertFalse(inbound.failed)
+            inbound.feed(b"\0" * 5)
+            self.assertTrue(inbound.failed)
+        self.assertEqual((session.server.buffered, session.buffered), (0, 0))
 
     def test_stun_descriptions_are_bounded(self) -> None:
         description = server.describe_stun_attributes(struct.pack("!HH", 0x8028, 0) * 5000)
@@ -536,11 +570,14 @@ class LimitsTest(unittest.TestCase):
 
 
 class FakeWriter:
+    def __init__(self) -> None:
+        self.sent = bytearray()  # what the server wrote, for a client to read
+
     def get_extra_info(self, name: str, default: object = None) -> object:
         return default
 
     def write(self, data: bytes) -> None:
-        pass
+        self.sent += data
 
     async def drain(self) -> None:
         pass
@@ -554,6 +591,21 @@ def request_headers(path: str, method: str = "POST", grpc: bool = False) -> list
     return headers + [("content-type", "application/grpc")] if grpc else headers
 
 
+BIDI_DEFLATE_HEADERS = request_headers("/test.Service/Bidi", grpc=True) + [("grpc-encoding", "deflate")]
+
+
+def compressed_frame(payload: bytes) -> bytes:
+    compressed = zlib.compress(payload)
+    return b"\x01" + len(compressed).to_bytes(4, "big") + compressed
+
+
+async def consume(call: server.Call, requests):
+    """A bidirectional handler that reads every request and answers once the client is done."""
+    async for request in requests:
+        del request
+    yield b""
+
+
 class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
     """Request bytes stay counted in Server.buffered exactly as long as they are kept."""
 
@@ -562,7 +614,8 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
             buffered=0, pending=0, downloads=0,
             backend=types.SimpleNamespace(bidi={"/test.Service/Bidi": None}),
             storage=types.SimpleNamespace(handle=lambda *args: server.response(404, b"none\n")))
-        self.session = server.H2Session(self.server, None, FakeWriter())
+        self.writer = FakeWriter()
+        self.session = server.H2Session(self.server, None, self.writer)
         self.session.conn.initiate_connection()
         self.client = h2.connection.H2Connection(h2.config.H2Configuration(client_side=True))
         self.client.initiate_connection()
@@ -575,6 +628,22 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
     async def settle(self) -> None:
         for _ in range(5):
             await asyncio.sleep(0)
+
+    def statuses(self) -> dict[int, int]:
+        """The grpc-status of each call the server answered, as the client reads it."""
+        statuses = {}
+        for event in self.client.receive_data(bytes(self.writer.sent)):
+            if isinstance(event, (h2.events.ResponseReceived, h2.events.TrailersReceived)):
+                headers = dict(event.headers)
+                if b"grpc-status" in headers:
+                    statuses[event.stream_id] = int(headers[b"grpc-status"])
+        self.writer.sent.clear()
+        return statuses
+
+    def serve_bidi(self, handler) -> None:
+        """Answers bidirectional calls with `handler`, through the server's own call handling."""
+        self.server.backend.bidi = {"/test.Service/Bidi": handler}
+        self.server.handle_grpc = lambda *args: server.Server.handle_grpc(self.server, *args)
 
     async def test_request_body_stays_counted_until_its_response_is_sent(self) -> None:
         self.client.send_headers(1, request_headers("/upload/x", "PUT"))
@@ -595,7 +664,75 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
         self.client.reset_stream(1)
         self.deliver()
         await self.settle()
-        self.assertEqual(self.server.buffered, 0)
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, 0))
+
+    async def test_decompressed_bidi_messages_count_against_the_connection(self) -> None:
+        payload = encode((1, b"x" * 1_000_000))
+        self.client.send_headers(1, BIDI_DEFLATE_HEADERS)
+        self.client.send_data(1, compressed_frame(payload) * 2)
+        self.deliver()  # the call has not read anything yet: both messages wait, decoded
+        self.assertEqual((self.server.buffered, self.session.buffered),
+                         (2 * (len(payload) + server.INBOUND_MESSAGE_OVERHEAD),) * 2)
+        self.client.reset_stream(1)
+        self.deliver()
+        await self.settle()
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, 0))
+
+    async def send_expanding_call(self) -> dict[int, int]:
+        """A bidirectional call whose one message decompresses from about 1 KB to 1 MB."""
+        self.serve_bidi(consume)
+        self.client.send_headers(1, BIDI_DEFLATE_HEADERS)
+        self.client.send_data(1, compressed_frame(encode((1, b"x" * 1_000_000))))
+        self.deliver()
+        await self.settle()
+        return self.statuses()
+
+    async def test_decoding_past_the_connection_budget_fails_the_call(self) -> None:
+        held = server.MAX_CONNECTION_BUFFER_BYTES - 100_000  # what the connection's other calls hold
+        self.session.buffered = held
+        self.assertEqual(await self.send_expanding_call(), {1: server.RESOURCE_EXHAUSTED})
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, held))
+        self.assertFalse(self.session.overloaded)  # the connection and its other calls go on
+
+    async def test_decoding_past_the_global_budget_fails_the_call(self) -> None:
+        held = server.MAX_BUFFERED_BYTES - 100_000  # what other connections hold
+        self.server.buffered = held
+        self.assertEqual(await self.send_expanding_call(), {1: server.RESOURCE_EXHAUSTED})
+        self.assertEqual((self.server.buffered, self.session.buffered), (held, 0))
+
+    async def test_compressed_calls_arriving_together_stay_within_the_budget(self) -> None:
+        payload = encode((1, b"x" * 400_000))
+        self.serve_bidi(consume)
+        with mock.patch.object(server, "MAX_CONNECTION_BUFFER_BYTES", 1_000_000):
+            for stream_id in (1, 3, 5):
+                self.client.send_headers(stream_id, BIDI_DEFLATE_HEADERS)
+                self.client.send_data(stream_id, compressed_frame(payload))
+            self.deliver()  # one batch, decoded before any of the calls reads a message
+            self.assertEqual((self.server.buffered, self.session.buffered),
+                             (2 * (len(payload) + server.INBOUND_MESSAGE_OVERHEAD),) * 2)
+            await self.settle()
+            self.assertEqual(self.statuses(), {5: server.RESOURCE_EXHAUSTED})
+            for stream_id in (1, 3):
+                self.client.reset_stream(stream_id)
+            self.deliver()
+            await self.settle()
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, 0))
+
+    async def test_queued_messages_are_released_when_the_call_ends(self) -> None:
+        async def refuse(call: server.Call, requests):
+            raise server.GrpcError(server.PERMISSION_DENIED, "not yours")
+            yield
+
+        self.serve_bidi(refuse)
+        payload = encode((1, b"x" * 100_000))
+        self.client.send_headers(1, BIDI_DEFLATE_HEADERS)
+        self.client.send_data(1, compressed_frame(payload))
+        self.deliver()
+        self.assertEqual((self.server.buffered, self.session.buffered),
+                         (len(payload) + server.INBOUND_MESSAGE_OVERHEAD,) * 2)
+        await self.settle()  # the call ends without reading its message
+        self.assertEqual(self.statuses(), {1: server.PERMISSION_DENIED})
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, 0))
 
     async def test_decoded_request_stays_counted_for_a_server_stream(self) -> None:
         release = asyncio.Event()
@@ -648,6 +785,38 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finish.call_args.args[0], server.RESOURCE_EXHAUSTED)
         self.assertEqual(self.session.buffered, server.MAX_CONNECTION_BUFFER_BYTES - 4096)
 
+    async def test_verbose_logging_cannot_leave_a_call_unanswered(self) -> None:
+        self.server.backend.streams = {}
+        self.server.backend.unary = {
+            "/test.Service/Count": lambda call, request: encode((1, len(request.fields[1])))}
+        payload = b"\x08\x01" * 1000
+        # Room for the request and no more, so logging it cannot parse it a second time.
+        held = server.MAX_CONNECTION_BUFFER_BYTES - server.message_cost(len(payload), 1000)
+        self.session.buffered = held
+        self.client.send_headers(1, request_headers("/test.Service/Count", grpc=True))
+        self.deliver()
+        with self.assertLogs(server.log, "DEBUG") as logs:
+            await server.Server.handle_grpc(self.server, server.H2Stream(self.session, 1),
+                                            {":path": "/test.Service/Count"},
+                                            b"\0" + len(payload).to_bytes(4, "big") + payload)
+        self.assertEqual(self.statuses(), {1: server.OK})
+        self.assertIn(f"<{len(payload)} bytes>", "\n".join(logs.output))
+        self.assertEqual((self.server.buffered, self.session.buffered), (0, held))
+
+    async def test_logged_payloads_are_rendered_within_the_budget(self) -> None:
+        inner = encode((2, 1))  # not printable, so rendered as a nested message
+        raw = encode((1, inner))
+        # Room for the outer message only: the nested one would count on top of it.
+        self.session.buffered = server.MAX_CONNECTION_BUFFER_BYTES - server.message_cost(len(raw), 1)
+        token = server.request_budget.set(self.session)
+        try:
+            self.assertEqual(server.dump(raw), f"1: <{len(inner)} bytes> {inner.hex()}")
+            self.session.buffered -= server.message_cost(len(inner), 1)
+            self.assertEqual(server.dump(raw), "1 {\n  2: 1\n}")
+        finally:
+            server.request_budget.reset(token)
+        self.assertEqual(self.server.buffered, 0)
+
     async def test_parsed_messages_count_until_dropped(self) -> None:
         token = server.request_budget.set(self.session)
         try:
@@ -677,7 +846,7 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
             server.request_budget.reset(token)
 
     async def test_bidi_request_counts_until_the_handler_lets_go(self) -> None:
-        inbound = server.GrpcInbound("identity", self.server)
+        inbound = server.GrpcInbound("identity", self.session)
         payload = encode((1, b"x" * 50000))
         frame = b"\0" + len(payload).to_bytes(4, "big") + payload
         cost = server.message_cost(len(payload), 1)
