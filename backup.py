@@ -39,7 +39,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import json
 import logging
+import os
 import secrets
 import shlex
 import subprocess
@@ -169,6 +171,29 @@ def report(stream, message: str) -> None:
         print(message, file=stream)
 
 
+def require_encrypted_destination() -> None:
+    """Refuse to stream secrets unless the configured destination is the expected crypt remote."""
+    remote = DESTINATION.partition(':')[0]
+    prefix = f"RCLONE_CONFIG_{remote.upper().replace('-', '_')}_"
+    if any(key.upper().startswith((prefix, 'RCLONE_CRYPT_')) for key in os.environ):
+        raise RuntimeError('rclone crypt environment overrides are not allowed for backups')
+    result = subprocess.run([*RCLONE, 'config', 'dump'], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+                            creationflags=NO_WINDOW, check=False)
+    if result.returncode:
+        raise RuntimeError('cannot read rclone configuration; backup not started')
+    try:
+        config = json.loads(result.stdout)[remote]
+        valid = (config.get('type') == 'crypt'
+                 and config.get('filename_encryption', 'standard') == 'standard'
+                 and str(config.get('directory_name_encryption', 'true')).lower() == 'true'
+                 and bool(config.get('password')) and bool(config.get('remote')))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        valid = False
+    if not valid:
+        raise RuntimeError('backup destination is not configured as an encrypted rclone crypt remote')
+
+
 def main() -> None:
     logging.basicConfig(filename=LOG, level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
@@ -184,8 +209,11 @@ def main() -> None:
     name = f'{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(6)}-{args.profile}.tar.gz'
     partial, final = f'{DESTINATION}/{name}.partial', f'{DESTINATION}/{name}'
     run = Run()
+    upload_started = False
     try:
+        require_encrypted_destination()
         run.rclone('mkdir', DESTINATION)
+        upload_started = True
         sha256, size, warnings = run.upload_snapshot(args.profile, partial)
         if run.read_back(partial) != (sha256, size):
             raise RuntimeError('the encrypted upload does not read back as the bytes sent')
@@ -194,10 +222,11 @@ def main() -> None:
         logging.exception('Backup failed')
         run.finish()
         # Only this run's uniquely named .partial object is ever deleted.
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run([*RCLONE, 'deletefile', partial], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
-                           creationflags=NO_WINDOW, check=False)
+        if upload_started:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run([*RCLONE, 'deletefile', partial], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
+                               creationflags=NO_WINDOW, check=False)
         report(sys.stderr, f'Backup failed: {exc}')
         sys.exit(1)
     run.finish()
