@@ -2,18 +2,18 @@
 """Live quest event transport for the EXPERIMENTAL Pokopia 2.0.1 story co-op patch.
 
 The patch (made by _scratch/quest_sync_trace/quest_sync_patch.py) gives the game a mailbox in its bss: a
-128-slot journal of quest state changes (cave J) and a 64-slot inbox that the game drains through its own
-quest writers (cave D). This module moves those changes between players over /campaign/live on the game
-backend, an HTTP/1.1 endpoint behind client certificates:
+128-slot journal of quest state changes that game threads reserve and commit (cave J) and a 64-slot inbox
+that the game drains through its own quest writers (cave D). This module moves those changes between players
+over /campaign/live on the game backend, an HTTP/1.1 endpoint behind client certificates:
 
 - HostRelay runs on the PC of the session creator's account. It sends story changes marked as local
   (journal origin 0), with sequence numbers so a resend after a lost answer does no harm.
 - GuestRelay runs on every other player's PC. It polls the events and queues them into the guest
   game's inbox. By default nothing a guest game does is sent. Only with propose=True, which the
   launcher does not set, does it post changes marked as local to /campaign/live/proposals for the
-  host to judge. This is not a complete or reliable account of local changes: the story journal
-  uses a global applying flag and non-atomic writer, so concurrent writes can be misclassified or
-  lost; deferred replay effects can also appear local (see GuestRelay).
+  host to judge. This is not a complete or reliable account of local changes: the journal holds changes in
+  the order game threads reserved them, which need not be the order of concurrent writers' stores; a full
+  journal drops changes (the relay then stops); deferred replay effects can appear local (see GuestRelay).
 
 Deliberately not solved here: applying unique-quest changes or guest proposals anywhere (no code here reads
 /campaign/live/proposals), a guest's initial quest state and durable stage checkpoints. A guest starts
@@ -34,10 +34,10 @@ under any member's role, another device of the creator's account included; a pro
 "guest". Either way its game must show the patched guest mask.
 
 Anything else unexpected also stops a relay (BridgeError) and turns the game's mailbox off: the process
-exits; a patch byte differs; the mailbox was not pristine or loses its contents; the journal overflows; the
-game's GameManager or capability mask changes; the server role, session or epoch changes; the server
-answers outside the contract. Only network trouble (LiveUnavailable) is retried, and only until
-offline_timeout runs out. A game whose relay stopped needs a restart before any relay will attach to it
+exits; a patch byte differs; the mailbox was not pristine or loses its contents; a journal loses changes or
+holds an invalid entry; the game's GameManager or capability mask changes; the server role, session or epoch
+changes; the server answers outside the contract. Only network trouble (LiveUnavailable) is retried, and only
+until offline_timeout runs out. A game whose relay stopped needs a restart before any relay will attach to it
 again.
 
 GameProcess, which attaches to the emulator, works only on Windows. The protocol classes accept any object
@@ -84,71 +84,78 @@ CAVE_CODE = bytes.fromhex(
     "f55b42a9f35341a9fd7bc3a8c0035fd6fd7bbca9fd030091f35301a9f55b02a9e01b00f9e03b00bdf30300aa74ae00f094020091"
     "880240b9296a8a524928a6721f01096ba1050054880640b968050036c8700090088943f9080500b4094d40f9490100b4c9700090"
     "299544f9e90000b4201940f9a00000b4090040f929a540f920013fd6a003003737bc779760030037c8700090089944f9080300b4"
-    "6300001428008052880a00b9891640b98a4200914afddf883f010a6be00100542b1500128c02049196596bb8290500118a520091"
-    "49fd9f885c000014e103162a79ffff97880e40b908050011880e00b9b5060071c1fdff549f0a00b9e01b40f9e03b40bdf55b42a9"
+    "680000142800805228fd9f88891640b98a4200914afddf883f010a6be00100542b1500128c02049196596bb8290500118a520091"
+    "49fd9f8862000014e103162a79ffff97880e40b908050011880e00b9b5060071c1fdff549f0a00b9e01b40f9e03b40bdf55b42a9"
     "f35341a9fd7bc4a8dac3651769ae00f0290100912a0140b92b6a8a524b28a6725f010b6b610500542a0540b92a050836fd7bbda9"
     "fd030091e00701a9e24f02a9a43b7a97131c0012e00741a9e21340f928040051c73b7a97e00741a9e21340f9421c0012213c0012"
-    "5f00136bc0020054480400511f0d007168020054280400511f9d0f710802005469ae00f0290100912a0940b94a010012730e0012"
-    "2b40132a6b51022a6b610a2a2c1940b98d1900122e010891cb592db88c0500112e610091ccfd9f88f31740f9fd7bc3a8c0035fd6"
-    "28040051a73b7a1769ae00f0290100912a0140b92b6a8a524b28a6725f010b6b610100542a0940b92a010034080040392a1140f9"
-    "4a25c89aaa0000362a2940b94a0500112a2900b9c0035fd6080040398246671789f2009129fddf8849f6ff3569d03bd5893200f9"
-    "1501805298ffff17c87e1c53082100511f05007169000054e00313aaa0ffff17c92e00122a0500515f1d0371c8030054cb6e1453"
-    "2a7b9552ea0da0727600e0364a090011040000146c0500519f110071a8020054c8700090089944f90809098b0c696a38cd4e0c53"
-    "9f010d6b2101005400010a8be1030b2ae201805217000094883240b908050011883200b986ffff17883640b908050011883600b9"
-    "2d00805206000014883a40b908050011883a00b90c0080124d008052964200b98c4600b9881640b908050051884a00b988f20091"
-    "0dfd9f8879ffff17e313bda9e51b01a903423bd5e70f02a90300403901000039211c00127f00016bc008005464ae00f084000091"
-    "850040b9266a8a524628a672bf00066be1070054850440b9a5071036c5700090a59844f9050005cb267b9552e60da072a50006cb"
-    "bf0040f2a1060054a6fc42d3c70400d1ff1c03f128060054a5040153c620032ac640012ac660052ac66c022a5f3c007161000054"
-    "c600073208000014850840b9c500003465d03bd5873040f9bf0007eb41000054c600063285500191a7fcdf8885400191a3fc5f88"
-    "6100074b3f0004712202005461040011a1fc028842ffff3585700191a2fc5f88bffc0188c1ffff35c67c022a611c001285001091"
-    "a50c018ba60000b961040011a5100091a1fc9f880a0000145f3f03d585600191a1fc5f8821040011a1fc0288a2ffff3521008052"
-    "85700191a1fc9f88e70f42a903421bd5e51b41a9e313c3a8c0035fd6e007bea9e27b01a90001098be1030a2a02008052a8ffff97"
-    "e27b41a9e007c2a87a267b17e007bea9e27b01a900010a8be103092a220080529fffff97e27b41a9e007c2a8252b7b17e007bea9"
-    "e27b01a90001098be1030a2a4200805296ffff97e27b41a9e007c2a8d22b7b17e007bea9e27b01a900010a8be103092a62008052"
-    "8dffff97e27b41a9e007c2a8a03a7b17e007bea9e27b01a90001098be1031f2a8200805284ffff97e27b41a9e007c2a892407b17"
-    "e007bea9e27b01a90001098be1030a2aa20080527bffff97e27b41a9e007c2a80d417b17e007bea9e27b01a90001098be1030a2a"
-    "c200805272ffff97e27b41a9e007c2a804427b17e007bea9e27b01a90001098be1031f2ae200805269ffff97e27b41a9e007c2a8"
-    "48427b17e007bea9e27b01a90001098be1030a2a0201805260ffff97e27b41a9e007c2a8ee427b17e007bea9e27b01a90001098b"
-    "e1030a2a2201805257ffff97e27b41a9e007c2a808457b17e007bea9e27b01a900010a8be103092a420180524effff97e27b41a9"
-    "e007c2a8e3457b17e007bea9e27b01a900010a8be103092a6201805245ffff97e27b41a9e007c2a87b467b17e007bea9e27b01a9"
-    "00011c8be103092a820180523cffff97e27b41a9e007c2a8e3487b17e007bea9e27b01a90001098be1030a2aa201805233ffff97"
-    "e27b41a9e007c2a8164c7b17"
+    "5f00136bc0020054480400511f0d007168020054280400511f9d0f710802005469ae00f029010091730e00122b40132a6b51022a"
+    "2a2100914afddf88ca0000346ad03bd52c3140f95f010ceb410000546b0108322da101912c010014f31740f9fd7bc3a8c0035fd6"
+    "28040051a73b7a1769ae00f0290100912a0140b92b6a8a524b28a6725f010b6b010200542a2100914afddf88aa0100346ad03bd5"
+    "2b3140f95f010beb21010054080040392a1140f94a25c89aaa0000362a2940b94a0500112a2900b9c0035fd6080040397d466717"
+    "89f2009129fddf88a9f5ff3569d03bd5893200f9150180528922009192ffff17c87e1c53082100511f05007169000054e00313aa"
+    "9affff17c92e00122a0500515f1d0371c8030054cb6e14532a7b9552ea0da0727600e0364a090011040000146c0500519f110071"
+    "a8020054c8700090089944f90809098b0c696a38cd4e0c539f010d6b2101005400010a8be1030b2ae201805217000094883240b9"
+    "08050011883200b980ffff17883640b908050011883600b92d00805206000014883a40b908050011883a00b90c0080124d008052"
+    "964200b98c4600b9881640b908050051884a00b988f200910dfd9f8873ffff17e313bda9e51b01a903423bd5e70f02a903004039"
+    "01000039211c00127f00016be008005464ae00f084000091850040b9266a8a524628a672bf00066b01080054850440b9c5071036"
+    "c5700090a59844f9050005cb267b9552e60da072a50006cbbf0040f2c1060054a6fc42d3c70400d1ff1c03f148060054a5040153"
+    "c620032ac640012ac660052ac66c022a5f3c007161000054c60007320900001485200091a5fcdf88c500003465d03bd5873040f9"
+    "bf0007eb41000054c600063285500191a7fcdf8885400191a3fc5f886100074b3f0004712202005461040011a1fc028842ffff35"
+    "85700191a2fc5f88bffc0188c1ffff35c67c022a611c001285001091a50c018ba60000b961040011a5100091a1fc9f880a000014"
+    "5f3f03d585600191a1fc5f8821040011a1fc0288a2ffff352100805285700191a1fc9f88e70f42a903421bd5e51b41a9e313c3a8"
+    "c0035fd6e007bea9e27b01a90001098be1030a2a02008052a7ffff97e27b41a9e007c2a873267b17e007bea9e27b01a900010a8b"
+    "e103092a220080529effff97e27b41a9e007c2a81e2b7b17e007bea9e27b01a90001098be1030a2a4200805295ffff97e27b41a9"
+    "e007c2a8cb2b7b17e007bea9e27b01a900010a8be103092a620080528cffff97e27b41a9e007c2a8993a7b17e007bea9e27b01a9"
+    "0001098be1031f2a8200805283ffff97e27b41a9e007c2a88b407b17e007bea9e27b01a90001098be1030a2aa20080527affff97"
+    "e27b41a9e007c2a806417b17e007bea9e27b01a90001098be1030a2ac200805271ffff97e27b41a9e007c2a8fd417b17e007bea9"
+    "e27b01a90001098be1031f2ae200805268ffff97e27b41a9e007c2a841427b17e007bea9e27b01a90001098be1030a2a02018052"
+    "5fffff97e27b41a9e007c2a8e7427b17e007bea9e27b01a90001098be1030a2a2201805256ffff97e27b41a9e007c2a801457b17"
+    "e007bea9e27b01a900010a8be103092a420180524dffff97e27b41a9e007c2a8dc457b17e007bea9e27b01a900010a8be103092a"
+    "6201805244ffff97e27b41a9e007c2a874467b17e007bea9e27b01a900011c8be103092a820180523bffff97e27b41a9e007c2a8"
+    "dc487b17e007bea9e27b01a90001098be1030a2aa201805232ffff97e27b41a9e007c2a80f4c7b172e610091aafddf88ccfd5f88"
+    "8f010a4bff010271820100548f05003142010054cffd0a880affff358a1900122d010891ab592ab82d013091ad492a8baffd9f88"
+    "c5feff175f3f03d52db10191aafd5f885f0500314a058a1aaafd0c888cffff35bdfeff17"
 )
-CAVE_CODE_SHA256 = "29321aad73934b4e8d60009f1be3fd66cace56592bcb2faba6f7311f6767fa8c"
+CAVE_CODE_SHA256 = "4697bccc7d79b379c0293985de88f96493aecf39827824f5ea73184ee56ab7a6"
 CAVE_BYTES = CAVE_CODE + bytes(CAVE_END - CAVE - len(CAVE_CODE))
 HOOKS = {
     0x0B1014: bytes.fromhex("1b619a14"),
     0x0B8B68: bytes.fromhex("a5429a94"),
     0x5D865C: bytes.fromhex("28c48514"),
     0x11B214: bytes.fromhex("6db99814"),
-    # Unique-quest journal sites; this relay does not enable or relay that journal yet.
-    0x613450: bytes.fromhex("7fd98414"),
-    0x6149F8: bytes.fromhex("27d48414"),
-    0x614720: bytes.fromhex("d4d48414"),
-    0x618554: bytes.fromhex("59c58414"),
-    0x619D40: bytes.fromhex("67bf8414"),
-    0x619F50: bytes.fromhex("ecbe8414"),
-    0x61A350: bytes.fromhex("f5bd8414"),
-    0x61A484: bytes.fromhex("b1bd8414"),
-    0x61A740: bytes.fromhex("0bbd8414"),
-    0x61AFCC: bytes.fromhex("f1ba8414"),
-    0x61B35C: bytes.fromhex("16ba8414"),
-    0x61B5E0: bytes.fromhex("7eb98414"),
-    0x61BFA4: bytes.fromhex("16b78414"),
-    0x61CC94: bytes.fromhex("e3b38414"),
+    # Natural unique-quest journal writers.
+    0x613450: bytes.fromhex("86d98414"),
+    0x6149F8: bytes.fromhex("2ed48414"),
+    0x614720: bytes.fromhex("dbd48414"),
+    0x618554: bytes.fromhex("60c58414"),
+    0x619D40: bytes.fromhex("6ebf8414"),
+    0x619F50: bytes.fromhex("f3be8414"),
+    0x61A350: bytes.fromhex("fcbd8414"),
+    0x61A484: bytes.fromhex("b8bd8414"),
+    0x61A740: bytes.fromhex("12bd8414"),
+    0x61AFCC: bytes.fromhex("f8ba8414"),
+    0x61B35C: bytes.fromhex("1dba8414"),
+    0x61B5E0: bytes.fromhex("85b98414"),
+    0x61BFA4: bytes.fromhex("1db78414"),
+    0x61CC94: bytes.fromhex("eab38414"),
 }
 if hashlib.sha256(CAVE_CODE).hexdigest() != CAVE_CODE_SHA256:
     raise ImportError("campaign_bridge: the embedded cave code is corrupt")
 
-MAILBOX, MAILBOX_SIZE = 0x3D18000, 0xC00
+MAILBOX, MAILBOX_SIZE = 0x3D18000, 0xE00
 MAGIC = 0x31425351  # "QSB1"; the caves stay inert until it is written
 MB_MAGIC, MB_FLAGS, MB_APPLYING, MB_APPLIED = 0x00, 0x04, 0x08, 0x0C
-MB_IN_W, MB_IN_R, MB_OUT_W = 0x10, 0x14, 0x18
+MB_IN_W, MB_IN_R = 0x10, 0x14
+MB_OUT_W = 0x18  # story journal reservations: game threads take seq = out_w with an exclusive increment
 MB_SKIP_MASK, MB_SKIPPED = 0x20, 0x28
 MB_UJ_W, MB_UJ_R, MB_UJ_LOST, MB_UJ_GAP = 0x50, 0x54, 0x58, 0x5C
+MB_DRAIN_TLS = 0x60  # u64 TPIDRRO_EL0 of the thread that last entered the drain; game-written
+MB_STORY_R = 0x68  # story journal read cursor, written only by this relay; a writer reserves while out_w - r < 128
+MB_STORY_LOST = 0x6C  # story changes dropped because the journal was full; game-written, never decreases
 MB_INBOX, INBOX_SLOTS = 0x100, 64  # u32 id | target << 16 | op << 24; written here, drained by cave D
-MB_JOURNAL, JOURNAL_SLOTS = 0x200, 128  # u32 id | old << 16 | new << 20 | origin << 24; written by cave J
+MB_JOURNAL, JOURNAL_SLOTS = 0x200, 128  # u32 id | old << 16 | new << 20 | origin << 24 for seq at slot seq % 128
 MB_UNIQUE_JOURNAL, UNIQUE_JOURNAL_SLOTS = 0x400, 256  # u32 event, u32 commit sequence
+MB_STORY_COMMITS = 0xC00  # u32 seq + 1 per story journal slot, release-stored by cave J after the entry
 HEADER_SIZE = MB_INBOX
 FLAG_DRAIN, FLAG_JOURNAL, FLAG_UNIQUE_JOURNAL = 1, 2, 4
 OP_GAME, OP_FORCE4 = 0, 1  # the patch's op 2 (raw state write) is never sent
@@ -210,7 +217,8 @@ class ProcessLost(BridgeError):
 
 
 class MailboxError(BridgeError):
-    """The mailbox was not pristine, lost its contents, was written by someone else, or a ring overflowed."""
+    """The mailbox was not pristine, lost its contents, was written by someone else, a journal lost changes, or
+    a journal holds an entry the patch cannot write."""
 
 
 class ProtocolError(BridgeError):
@@ -295,14 +303,21 @@ class LiveView:
 
 @dataclass(frozen=True)
 class JournalEntry:
+    """A story quest change from the journal, which holds them in reservation order (see Mailbox.read_journal)."""
+
     id: int
-    old: int
+    old: int  # the low 4 bits of the state cave J read before the setter ran
     new: int
-    origin: int  # 0: the game changed the quest itself, 1: the inbox drain did
+    origin: int  # 1: written on the drain's thread while it applied inbox entries, 0: otherwise
 
     @classmethod
     def decode(cls, word: int) -> JournalEntry:
-        return cls(word & 0xFFFF, word >> 16 & 0xF, word >> 20 & 0xF, word >> 24 & 0xFF)
+        """Raises MailboxError for a word cave J never writes: a quest id outside 1..1000, a new state outside
+        1..4 or an origin other than 0 and 1."""
+        entry = cls(word & 0xFFFF, word >> 16 & 0xF, word >> 20 & 0xF, word >> 24 & 0xFF)
+        if entry.id not in QUEST_IDS or entry.new not in QUEST_STATES or entry.origin > 1:
+            raise MailboxError(f"invalid story quest journal entry {word:#010x}")
+        return entry
 
 
 @dataclass(frozen=True)
@@ -581,9 +596,9 @@ class GameProcess:
 # --- The mailbox ------------------------------------------------------------------------------------------
 
 class Mailbox:
-    """The relay's side of the patch mailbox in one game. The game writes the inbox read index,
-    counters and journal entries; this object owns the inbox write index and unique-journal read index.
-    check() detects a restarted game, a foreign writer and journal overflow."""
+    """The relay's side of the patch mailbox in one game. The game writes the inbox read index, counters,
+    journal reservations, entries, commits and loss counts; this object owns the inbox write index and both
+    journal read cursors. check() detects a restarted game, a foreign writer and journal loss."""
 
     def __init__(self, game: Game, *, drain: bool, journal: bool, unique_journal: bool = False,
                  skip_mask: int = DEFAULT_SKIP_MASK) -> None:
@@ -595,15 +610,16 @@ class Mailbox:
                       | (FLAG_UNIQUE_JOURNAL if unique_journal else 0))
         self.skip_mask = skip_mask
         self.attached = False
-        self.in_w = self.in_r = self.out_r = self.unique_r = 0
+        self.in_w = self.in_r = self.story_r = self.unique_r = 0
         self.applied = self.skipped = 0
 
     def attach(self) -> None:
         """Arms the caves of a mailbox nobody has used. A mailbox that is not all zero belongs to an earlier
-        attachment or to a game that is not fresh, and is refused before anything is written."""
+        attachment or to a game that is not fresh, and is refused before anything is written; so both journal
+        read cursors start at zero."""
         if self.attached:
             raise RuntimeError("the mailbox is already attached")
-        if self.flags & FLAG_UNIQUE_JOURNAL:
+        if self.flags & (FLAG_JOURNAL | FLAG_UNIQUE_JOURNAL):
             verify_patch(self.game.read, self.game.main)
         if self.game.read(self.base, MAILBOX_SIZE) != bytes(MAILBOX_SIZE):
             raise MailboxError("the quest mailbox is not pristine; start a fresh game before attaching")
@@ -622,11 +638,36 @@ class Mailbox:
     def _u32(self, offset: int) -> int:
         return struct.unpack("<I", self.game.read(self.base + offset, 4))[0]
 
-    def _unique_end(self, header: bytes) -> int:
+    def _header(self) -> bytes:
+        """The mailbox header, which must still hold the magic and this relay's flags."""
+        header = self.game.read(self.base, HEADER_SIZE)
         if struct.unpack_from("<I", header, MB_MAGIC)[0] != MAGIC:
             raise MailboxError("the quest mailbox lost its contents")
         if struct.unpack_from("<I", header, MB_FLAGS)[0] != self.flags:
             raise MailboxError("the quest mailbox flags changed")
+        return header
+
+    def _story_end(self, header: bytes) -> int:
+        """Validates the story journal's header words and returns out_w, the sequence after the last reserved
+        entry."""
+        written = struct.unpack_from("<I", header, MB_OUT_W)[0]
+        read, lost = struct.unpack_from("<2I", header, MB_STORY_R)
+        if not self.flags & FLAG_JOURNAL:
+            if written or read or lost:
+                raise MailboxError("the disabled story quest journal was changed")
+            return 0
+        if read != self.story_r:
+            raise MailboxError("the story quest journal read cursor was changed by someone other than this relay")
+        if lost:
+            raise MailboxError(f"the story quest journal was full: {lost} quest changes were lost; "
+                               f"resynchronization is required")
+        if written < read or written >= U32 - JOURNAL_SLOTS:
+            raise MailboxError("the story quest journal sequence is invalid or exhausted")
+        if written - read > JOURNAL_SLOTS:
+            raise MailboxError("the story quest journal exceeds its capacity")
+        return written
+
+    def _unique_end(self, header: bytes) -> int:
         written, read, lost, gap = struct.unpack_from("<4I", header, MB_UJ_W)
         if not self.flags & FLAG_UNIQUE_JOURNAL:
             if written or read or lost or gap:
@@ -647,46 +688,63 @@ class Mailbox:
         if not self.attached:
             raise RuntimeError("the mailbox is not attached")
         header = self.game.read(self.base, HEADER_SIZE)
-        magic, flags, applying, applied, in_w, in_r, out_w = struct.unpack_from("<7I", header)
+        magic, flags, applying, applied, in_w, in_r = struct.unpack_from("<6I", header)
         skip_mask, skipped = struct.unpack_from("<QI", header, MB_SKIP_MASK)
         if magic != MAGIC:
             raise MailboxError("the quest mailbox lost its contents (the game restarted or its memory was reset)")
         if (flags != self.flags or skip_mask != self.skip_mask or applying > 1 or in_w != self.in_w
                 or header[0x1C:MB_SKIP_MASK] != bytes(4) or header[0x2C:MB_UJ_W] != bytes(0x24)
-                or header[0x68:] != bytes(HEADER_SIZE - 0x68)):
+                or header[MB_STORY_LOST + 4:] != bytes(HEADER_SIZE - MB_STORY_LOST - 4)):
             raise MailboxError("the quest mailbox was changed by someone other than this relay and the game")
         self._unique_end(header)
+        self._story_end(header)
         taken = (in_r - self.in_r) & U32
         if taken > (self.in_w - self.in_r) & U32:
             raise MailboxError("the game's inbox read index is past the entries this relay queued")
-        if (out_w - self.out_r) & U32 > JOURNAL_SLOTS:
-            raise MailboxError(f"the quest journal overflowed: {((out_w - self.out_r) & U32) - JOURNAL_SLOTS} "
-                               f"quest changes were lost")
         self.in_r, self.applied, self.skipped = in_r, applied, skipped
         return taken
 
     def read_journal(self) -> list[JournalEntry]:
-        """The journal entries written since the last call, in game order. Raises MailboxError if the
-        128-slot ring wrapped past an entry before it was read: those quest changes are lost."""
-        start = self.out_r
-        end = self._u32(MB_OUT_W)
-        count = (end - start) & U32
-        if count > JOURNAL_SLOTS:
-            raise MailboxError(f"the quest journal overflowed: {count - JOURNAL_SLOTS} quest changes were lost")
-        if not count:
+        """Reads the committed story quest changes after the read cursor, in reservation order, and acknowledges
+        them by moving the cursor past them, which frees their slots. Reading stops at the first reserved entry
+        that is not committed yet; it and everything after it wait for a later call.
+
+        Game threads reserve after their quest store, so the entries of concurrent writers need not be in the
+        order of their stores, and an entry's old state need not be what the previous entry for that quest set:
+        the journal is neither a causal order nor an atomic snapshot of quest states. A loss, a cursor written
+        by someone else, a sequence out of bounds, a commit cave J cannot have written or an invalid entry stops
+        the relay with nothing acknowledged; the header is checked before and after the copy."""
+        if not self.attached or not self.flags & FLAG_JOURNAL:
+            raise RuntimeError("the story quest journal is not attached")
+        start = self.story_r
+        end = self._story_end(self._header())
+        if end == start:
             return []
+        # Commits before entries: an entry is complete once its commit, stored after it, reads seq + 1, and the
+        # game does not reuse its slot before this relay moves the cursor past it.
+        commits = struct.unpack(f"<{JOURNAL_SLOTS}I", self.game.read(self.base + MB_STORY_COMMITS, 4 * JOURNAL_SLOTS))
         ring = struct.unpack(f"<{JOURNAL_SLOTS}I", self.game.read(self.base + MB_JOURNAL, 4 * JOURNAL_SLOTS))
-        if (self._u32(MB_OUT_W) - start) & U32 > JOURNAL_SLOTS:
-            raise MailboxError("the quest journal overflowed while it was read; quest changes were lost")
-        self.out_r = end
-        return [JournalEntry.decode(ring[(start + i) % JOURNAL_SLOTS]) for i in range(count)]
+        self._story_end(self._header())  # a loss, a restart or a foreign cursor during the copy acknowledges nothing
+        committed = start
+        while committed < end and commits[committed % JOURNAL_SLOTS] == committed + 1:
+            committed += 1
+        for sequence in range(committed, end):  # reserved: committed out of order, or still the previous lap's
+            commit = commits[sequence % JOURNAL_SLOTS]
+            if commit not in (sequence + 1, max(sequence + 1 - JOURNAL_SLOTS, 0)):
+                raise MailboxError(f"the story quest journal commit of sequence {sequence} reads {commit:#x}, "
+                                   f"which cave J never writes there")
+        entries = [JournalEntry.decode(ring[sequence % JOURNAL_SLOTS]) for sequence in range(start, committed)]
+        if entries:
+            self.game.write(self.base + MB_STORY_R, struct.pack("<I", committed))
+            self.story_r = committed
+        return entries
 
     def read_unique_journal(self) -> list[UniqueJournalEntry]:
         """Read committed unique-quest changes in reservation order. A loss or a changed read index
         stops the relay; an uncommitted reservation is left for the next call."""
         if not self.attached or not self.flags & FLAG_UNIQUE_JOURNAL:
             raise RuntimeError("the unique quest journal is not attached")
-        end = self._unique_end(self.game.read(self.base, HEADER_SIZE))
+        end = self._unique_end(self._header())
         sequence = self.unique_r
         events = []
         while sequence < end:
@@ -695,7 +753,7 @@ class Mailbox:
                 break
             events.append(UniqueJournalEntry.decode(sequence, self._u32(slot)))
             sequence += 1
-        self._unique_end(self.game.read(self.base, HEADER_SIZE))
+        self._unique_end(self._header())
         if events:
             self.game.write(self.base + MB_UJ_R, struct.pack("<I", sequence))
             self.unique_r = sequence
@@ -1058,8 +1116,9 @@ class _Relay:
 
 
 class HostRelay(_Relay):
-    """Runs on the session creator's PC: sends the host game's own quest changes (journal origin 0), in game
-    order, as the seqs after the server's journal end.
+    """Runs on the session creator's PC: sends the host game's own quest changes (journal origin 0), in journal
+    (reservation) order, as the seqs after the server's journal end. For changes made concurrently on different
+    threads that order need not be the order of their stores (see Mailbox.read_journal).
 
     The drain stays off on the host, so its journal can never hold a replay; an origin 1 entry means
     someone else touched the mailbox, and stops the relay. Changes wait in `pending` while the server is
@@ -1167,12 +1226,13 @@ class GuestRelay(_Relay):
     batch (a conflict, a gap, a number it no longer keeps, a new epoch, a host that left) or answers outside
     the contract. A new relay is a new producer, and the server takes at most 64 producers per epoch.
 
-    The numbers order each journal on its own: story changes in observed order, unique changes in reservation
-    order. The rings are separate, so between a story and a unique proposal the numbers only say which
-    ring a step read first (story), not which change came first. The story journal's global applying flag
-    can mark a concurrent local change as a replay, and concurrent writers can lose story entries without
-    detecting overflow. Conversely, a deferred replay effect can appear local. This sender is not a reliable
-    basis for campaign synchronization."""
+    The numbers order each journal on its own, in reservation order, which for concurrent writers need not be
+    the order of their stores. The rings are separate, so between a story and a unique proposal the numbers
+    only say which ring a step read first (story), not which change came first. A story change counts as a
+    replay only when the drain's own thread made it while applying inbox entries, so another thread's change
+    during a replay stays local; conversely, a deferred replay effect, made after the drain returned, appears
+    local. A full story journal drops changes and stops the relay. This sender is not a reliable basis for
+    campaign synchronization."""
 
     _host_side = False
 
@@ -1236,8 +1296,6 @@ class GuestRelay(_Relay):
         for _ in range(self._check_game()):
             self.consumed = self._inbox.popleft()
         for entry in self.mailbox.read_journal():
-            if self._propose and entry.origin > 1:
-                raise MailboxError(f"the guest journal holds a change of unknown origin: {entry}")
             if entry.origin:
                 self.replayed += 1
                 log.debug("guest replayed quest %d: %d -> %d", entry.id, entry.old, entry.new)

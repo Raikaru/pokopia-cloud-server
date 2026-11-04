@@ -1,17 +1,19 @@
 """Tests of campaign_bridge, the live quest event transport: event order, loss, retries and fail-closed stops.
 
 The relays run against a simulated patched game: the patch bytes, the capability mask, and a mailbox whose
-game side behaves like caves J and D and the unique-quest journal. They talk over real TLS with client
-certificates to a test double of /campaign/live and /campaign/live/proposals, which is written from the shared
-contract and not taken from server.py; ServerContractTest puts server.py's own CampaignLive behind the same
-transport when server.py's dependencies are installed. On Windows, GameProcess also attaches to a child
-process laid out like the game.
+game side behaves like caves J (reserve, entry, commit, loss count) and D and the unique-quest journal, with
+the drain's thread told apart from other game threads. This simulates the patch's specified behavior; it does
+not test the patch. The relays talk over real TLS with client certificates to a test double of /campaign/live
+and /campaign/live/proposals, which is written from the shared contract and not taken from server.py;
+ServerContractTest puts server.py's own CampaignLive behind the same transport when server.py's dependencies
+are installed. On Windows, GameProcess also attaches to a child process laid out like the game.
 
     .\\.venv\\Scripts\\python.exe -m unittest test_campaign_bridge
 """
 from __future__ import annotations
 
 import datetime
+import functools
 import http.server
 import json
 import logging
@@ -46,13 +48,15 @@ SPECTATOR_CAPS = 0x0387800000  # 00 00 80 87 03
 SESSION = "sessions/coop one"
 EPOCH = "abcdefghijklmnopqrst"
 SERVER_NAME = "campaign.test"
+GAME_THREAD, OTHER_THREAD = 0x7F0000100000, 0x7F0000200000  # TPIDRRO_EL0 of the story update thread and another
 
 
 # --- The game ------------------------------------------------------------------------------------------------
 
 class FakeGame:
     """The patched game as a relay sees it. Its mailbox side follows the caves: set_quest journals like cave J
-    around the quest state setter, frame() drains like cave D and apply_one."""
+    around the quest state setter, frame() drains like cave D and apply_one. `thread` is the TPIDRRO_EL0 of the
+    game thread that runs: GAME_THREAD, which also runs the drain, unless a change names another."""
 
     def __init__(self, host: bool, caps: int | None = None) -> None:
         if caps is None:
@@ -70,6 +74,7 @@ class FakeGame:
         self.taken: list[tuple[int, int, int]] = []  # (id, target, op) of every inbox entry the drain took
         self.writes: list[tuple[int, bytes]] = []  # (mailbox offset, data) the relay wrote
         self.exited = False
+        self.thread = GAME_THREAD
         self.on_journal_read: Callable[[], None] | None = None
         # (story quest, new state) -> the unique changes (id, old, new, field, site) its writer makes as well
         self.unique_effects: dict[tuple[int, int], list[tuple[int, int, int, str, int]]] = {}
@@ -107,6 +112,16 @@ class FakeGame:
     def set_u32(self, offset: int, value: int) -> None:
         struct.pack_into("<I", self.mb, offset, value & 0xFFFFFFFF)
 
+    def u64(self, offset: int) -> int:
+        return struct.unpack_from("<Q", self.mb, offset)[0]
+
+    def set_u64(self, offset: int, value: int) -> None:
+        struct.pack_into("<Q", self.mb, offset, value)
+
+    def on_drain_thread(self) -> bool:
+        """What the patch's journals test: the drain is applying and this thread entered it."""
+        return self.u32(cb.MB_APPLYING) != 0 and self.thread == self.u64(cb.MB_DRAIN_TLS)
+
     def set_caps(self, caps: int) -> None:
         self.memory[MANAGER + 0x8C][:] = caps.to_bytes(5, "little")
 
@@ -117,23 +132,58 @@ class FakeGame:
         """The game's quest state setter with cave J around it, and the unique changes it makes with it."""
         old = self.states.get(qid, 1)
         self.states[qid] = new
-        if self.armed(cb.FLAG_JOURNAL) and old != new and 1 <= new <= 4 and 1 <= qid <= 1000:
-            w = self.u32(cb.MB_OUT_W)
-            word = qid | (old & 0xF) << 16 | new << 20 | (self.u32(cb.MB_APPLYING) & 1) << 24
-            self.set_u32(cb.MB_JOURNAL + 4 * (w % cb.JOURNAL_SLOTS), word)
-            self.set_u32(cb.MB_OUT_W, w + 1)
+        if old != new and 1 <= new <= 4 and 1 <= qid <= 1000:
+            seq = self.reserve_story(qid, old, new)
+            if seq is not None:
+                self.commit_story(seq)
         if old != new:
             for effect in self.unique_effects.get((qid, new), ()):
                 self.unique_change(*effect)
 
+    def reserve_story(self, qid: int, old: int, new: int, origin: int | None = None) -> int | None:
+        """Cave J after the setter: origin 1 on the drain's thread while it applies, else 0, unless given. A
+        sequence is reserved only while the journal has room and below 0xffffffff, then the entry is stored;
+        returns the sequence for commit_story. Otherwise nothing is reserved or overwritten, and the loss count
+        goes up (saturating)."""
+        if not self.armed(cb.FLAG_JOURNAL):
+            return None
+        if origin is None:
+            origin = int(self.on_drain_thread())
+        w = self.u32(cb.MB_OUT_W)
+        if (w - self.u32(cb.MB_STORY_R)) & 0xFFFFFFFF >= cb.JOURNAL_SLOTS or w == 0xFFFFFFFF:
+            self.set_u32(cb.MB_STORY_LOST, min(self.u32(cb.MB_STORY_LOST) + 1, 0xFFFFFFFF))
+            return None
+        self.set_u32(cb.MB_OUT_W, w + 1)
+        self.set_u32(cb.MB_JOURNAL + 4 * (w % cb.JOURNAL_SLOTS), qid | (old & 0xF) << 16 | new << 20 | origin << 24)
+        return w
+
+    def commit_story(self, seq: int) -> None:
+        """Cave J's release store that publishes the entry of sequence seq."""
+        self.set_u32(cb.MB_STORY_COMMITS + 4 * (seq % cb.JOURNAL_SLOTS), seq + 1)
+
+    def forge_story(self, word: int) -> None:
+        """A committed story journal entry that cave J would never write, from someone else."""
+        w = self.u32(cb.MB_OUT_W)
+        self.set_u32(cb.MB_JOURNAL + 4 * (w % cb.JOURNAL_SLOTS), word)
+        self.set_u32(cb.MB_OUT_W, w + 1)
+        self.commit_story(w)
+
+    def fast_forward(self, seq: int) -> None:
+        """A story journal that has already carried seq changes, all of them read."""
+        for done in range(max(seq - cb.JOURNAL_SLOTS, 0), seq):
+            self.commit_story(done)
+        self.set_u32(cb.MB_OUT_W, seq)
+        self.set_u32(cb.MB_STORY_R, seq)
+
     def unique_change(self, qid: int, old: int, new: int, field: str, site: int, origin: int | None = None) -> None:
         """A unique-quest byte write with the patch's unique journal around its writer: origin 2 (a side effect
-        on the drain thread) while the drain applies an entry, else 0, unless given. A reservation is counted
-        before its entry is committed; a full ring drops the change and counts it as lost."""
+        on the drain thread) while the drain applies an entry on this thread, else 0, unless given. A
+        reservation is counted before its entry is committed; a full ring drops the change and counts it as
+        lost."""
         if not self.armed(cb.FLAG_UNIQUE_JOURNAL):
             return
         if origin is None:
-            origin = 2 if self.u32(cb.MB_APPLYING) else 0
+            origin = 2 if self.on_drain_thread() else 0
         w = self.u32(cb.MB_UJ_W)
         if w - self.u32(cb.MB_UJ_R) >= cb.UNIQUE_JOURNAL_SLOTS:
             self.set_u32(cb.MB_UJ_LOST, self.u32(cb.MB_UJ_LOST) + 1)
@@ -143,15 +193,21 @@ class FakeGame:
         self.set_u32(slot, qid | old << 8 | new << 16 | (field == "counter") << 24 | origin << 25 | site << 27)
         self.set_u32(slot + 4, w + 1)
 
-    def change(self, qid: int, old: int, new: int) -> None:
-        """A quest change the game makes itself."""
-        self.states[qid] = old
-        self.set_quest(qid, new)
+    def change(self, qid: int, old: int, new: int, thread: int | None = None) -> None:
+        """A quest change the game makes itself, on GAME_THREAD unless another thread is given."""
+        running, self.thread = self.thread, self.thread if thread is None else thread
+        try:
+            self.states[qid] = old
+            self.set_quest(qid, new)
+        finally:
+            self.thread = running
 
-    def frame(self, budget: int = 8) -> None:
-        """Cave D: takes up to 8 inbox entries before the story quest update."""
+    def frame(self, budget: int = 8, during: Callable[[], None] | None = None) -> None:
+        """Cave D: records its thread, then takes up to 8 inbox entries before the story quest update. during
+        runs while the drain is still applying, as another thread's work would."""
         if not self.armed(cb.FLAG_DRAIN):
             return
+        self.set_u64(cb.MB_DRAIN_TLS, self.thread)
         self.set_u32(cb.MB_APPLYING, 1)
         for _ in range(budget):
             r = self.u32(cb.MB_IN_R)
@@ -161,6 +217,8 @@ class FakeGame:
             self.set_u32(cb.MB_IN_R, r + 1)
             self.apply_one(word)
             self.set_u32(cb.MB_APPLIED, self.u32(cb.MB_APPLIED) + 1)
+        if during:
+            during()
         self.set_u32(cb.MB_APPLYING, 0)
 
     def apply_one(self, word: int) -> None:
@@ -584,41 +642,139 @@ class ProposalTest(unittest.TestCase):
 
 class MailboxTest(unittest.TestCase):
     def test_a_used_mailbox_is_refused_without_writing(self) -> None:
-        game = FakeGame(host=True)
-        game.set_u32(cb.MB_OUT_W, 1)
-        with self.assertRaises(cb.MailboxError):
-            cb.Mailbox(game, drain=False, journal=True).attach()
-        self.assertEqual(game.writes, [])
+        self.assertEqual(cb.MB_STORY_COMMITS + 4 * cb.JOURNAL_SLOTS, cb.MAILBOX_SIZE)
+        for offset in (cb.MB_OUT_W, cb.MB_STORY_R, cb.MB_STORY_LOST, cb.MAILBOX_SIZE - 4):
+            with self.subTest(offset=hex(offset)):
+                game = FakeGame(host=True)
+                game.set_u32(offset, 1)
+                with self.assertRaises(cb.MailboxError):
+                    cb.Mailbox(game, drain=False, journal=True).attach()
+                self.assertEqual(game.writes, [])
 
-
-    def test_journal_overflow_is_never_silent(self) -> None:
+    def test_a_full_journal_drops_changes_without_overwriting_and_stops(self) -> None:
         game = FakeGame(host=True)
         mailbox = cb.Mailbox(game, drain=False, journal=True)
         mailbox.attach()
         for qid in range(1, 129):
             game.change(qid, 1, 2)
         self.assertEqual([e.id for e in mailbox.read_journal()], list(range(1, 129)))
+        self.assertEqual(game.u32(cb.MB_STORY_R), 128)
         for qid in range(1, 130):
             game.change(qid, 2, 3)
-        with self.assertRaisesRegex(cb.MailboxError, "1 quest changes were lost"):
-            mailbox.read_journal()
+        self.assertEqual((game.u32(cb.MB_OUT_W), game.u32(cb.MB_STORY_LOST)), (256, 1))
+        ring = [cb.JournalEntry.decode(game.u32(cb.MB_JOURNAL + 4 * slot)) for slot in range(cb.JOURNAL_SLOTS)]
+        self.assertEqual(ring, [cb.JournalEntry(qid, 2, 3, 0) for qid in range(1, 129)])  # quest 129 was dropped
+        for read in (mailbox.read_journal, mailbox.check):
+            with self.assertRaisesRegex(cb.MailboxError, "1 quest changes were lost"):
+                read()
+        self.assertEqual(game.u32(cb.MB_STORY_R), 128)
 
-    def test_journal_wrapping_while_it_is_read_is_loss(self) -> None:
+    def test_loss_or_damage_around_a_read_acknowledges_nothing(self) -> None:
+        damages = {"loss": lambda g: [g.change(qid, 1, 2) for qid in range(3, 131)],  # 127 fit, 1 is dropped
+                   "cursor moved back": lambda g: g.set_u32(cb.MB_STORY_R, 0),
+                   "cursor moved ahead": lambda g: g.set_u32(cb.MB_STORY_R, 2),
+                   "reservations behind the cursor": lambda g: g.set_u32(cb.MB_OUT_W, 0),
+                   "reservations past capacity": lambda g: g.set_u32(cb.MB_OUT_W, 2 + cb.JOURNAL_SLOTS),
+                   "restart": lambda g: g.mb.__setitem__(slice(None), bytes(cb.MAILBOX_SIZE))}
+        for when in ("before", "during"):
+            for name, damage in damages.items():
+                with self.subTest(when=when, damage=name):
+                    game = FakeGame(host=True)
+                    mailbox = cb.Mailbox(game, drain=False, journal=True)
+                    mailbox.attach()
+                    game.change(1, 1, 2)
+                    self.assertEqual(len(mailbox.read_journal()), 1)
+                    game.change(2, 1, 2)
+                    writes = len(game.writes)
+                    if when == "before":
+                        damage(game)
+                    else:
+                        game.on_journal_read = functools.partial(damage, game)
+                    with self.assertRaises(cb.MailboxError):
+                        mailbox.read_journal()
+                    self.assertEqual((len(game.writes), mailbox.story_r), (writes, 1))
+
+    def test_entries_committed_out_of_order_wait_for_the_ones_reserved_before_them(self) -> None:
         game = FakeGame(host=True)
         mailbox = cb.Mailbox(game, drain=False, journal=True)
         mailbox.attach()
-        game.change(1, 1, 2)
-        game.on_journal_read = lambda: [game.change(qid, 1, 2) for qid in range(2, 130)]
-        with self.assertRaisesRegex(cb.MailboxError, "while it was read"):
-            mailbox.read_journal()
+        first, second = game.reserve_story(5, 1, 2), game.reserve_story(6, 1, 3)
+        game.commit_story(second)
+        self.assertEqual(mailbox.read_journal(), [])
+        self.assertEqual((game.u32(cb.MB_STORY_R), mailbox.check()), (0, 0))
+        game.on_journal_read = lambda: game.commit_story(first)  # after the commits were read: taken next time
+        self.assertEqual(mailbox.read_journal(), [])
+        third = game.reserve_story(7, 2, 4)
+        self.assertEqual(mailbox.read_journal(), [cb.JournalEntry(5, 1, 2, 0), cb.JournalEntry(6, 1, 3, 0)])
+        self.assertEqual(game.u32(cb.MB_STORY_R), 2)
+        game.commit_story(third)
+        self.assertEqual(mailbox.read_journal(), [cb.JournalEntry(7, 2, 4, 0)])
+        self.assertEqual(game.u32(cb.MB_STORY_R), 3)
 
-    def test_unique_journal_refuses_an_incompatible_patch_before_writing(self) -> None:
+    def test_slots_are_reused_only_after_their_entries_were_read(self) -> None:
         game = FakeGame(host=True)
-        game.memory[MAIN + 0x6149F8][0] ^= 1
-        mailbox = cb.Mailbox(game, drain=False, journal=False, unique_journal=True)
-        with self.assertRaises(cb.PatchMismatch):
-            mailbox.attach()
-        self.assertEqual(game.writes, [])
+        mailbox = cb.Mailbox(game, drain=False, journal=True)
+        mailbox.attach()
+        for _ in range(3):
+            for qid in range(1, 101):
+                game.change(qid, 1, 2)
+            self.assertEqual([e.id for e in mailbox.read_journal()], list(range(1, 101)))
+        first, second = game.reserve_story(1, 2, 3), game.reserve_story(2, 2, 3)  # slots of sequences 172 and 173
+        game.commit_story(second)
+        self.assertEqual(mailbox.read_journal(), [])
+        game.commit_story(first)
+        self.assertEqual(mailbox.read_journal(), [cb.JournalEntry(1, 2, 3, 0), cb.JournalEntry(2, 2, 3, 0)])
+        self.assertEqual(game.u32(cb.MB_STORY_R), 302)
+
+    def test_invalid_entries_or_commits_stop_it_with_nothing_acknowledged(self) -> None:
+        words = {"quest 0": 1 << 16 | 2 << 20, "quest 1001": 1001 | 1 << 16 | 2 << 20, "new state 0": 5 | 1 << 16,
+                 "new state 5": 5 | 1 << 16 | 5 << 20, "origin 2": 5 | 1 << 16 | 2 << 20 | 2 << 24,
+                 "top bit": 5 | 1 << 16 | 2 << 20 | 1 << 31}
+        for name, word in words.items():
+            with self.subTest(name):
+                game = FakeGame(host=True)
+                mailbox = cb.Mailbox(game, drain=False, journal=True)
+                mailbox.attach()
+                game.change(4, 1, 2)  # valid, but it is not acknowledged either
+                game.forge_story(word)
+                with self.assertRaisesRegex(cb.MailboxError, "invalid story quest journal entry"):
+                    mailbox.read_journal()
+                self.assertEqual((game.u32(cb.MB_STORY_R), mailbox.story_r), (0, 0))
+        for name, commit in (("garbage", 0x1234), ("a later lap", 2 + cb.JOURNAL_SLOTS)):
+            with self.subTest(name):
+                game = FakeGame(host=True)
+                mailbox = cb.Mailbox(game, drain=False, journal=True)
+                mailbox.attach()
+                game.change(4, 1, 2)
+                seq = game.reserve_story(5, 1, 2)
+                game.set_u32(cb.MB_STORY_COMMITS + 4 * seq, commit)
+                with self.assertRaisesRegex(cb.MailboxError, "commit"):
+                    mailbox.read_journal()
+                self.assertEqual((game.u32(cb.MB_STORY_R), mailbox.story_r), (0, 0))
+
+    def test_the_story_sequence_never_wraps(self) -> None:
+        game = FakeGame(host=True)
+        mailbox = cb.Mailbox(game, drain=False, journal=True)
+        mailbox.attach()
+        start = cb.U32 - cb.JOURNAL_SLOTS - 2
+        game.fast_forward(start)
+        mailbox.story_r = start  # as if this relay had read all of them
+        game.change(1, 1, 2)
+        self.assertEqual(mailbox.read_journal(), [cb.JournalEntry(1, 1, 2, 0)])
+        game.change(2, 1, 2)
+        with self.assertRaisesRegex(cb.MailboxError, "exhausted"):
+            mailbox.read_journal()
+        self.assertEqual(game.u32(cb.MB_STORY_R), start + 1)
+
+    def test_journals_refuse_an_incompatible_patch_before_writing(self) -> None:
+        for journal, unique_journal in ((True, False), (False, True)):
+            with self.subTest(journal=journal, unique_journal=unique_journal):
+                game = FakeGame(host=True)
+                game.memory[MAIN + 0x6149F8][0] ^= 1
+                mailbox = cb.Mailbox(game, drain=False, journal=journal, unique_journal=unique_journal)
+                with self.assertRaises(cb.PatchMismatch):
+                    mailbox.attach()
+                self.assertEqual(game.writes, [])
 
     def test_unique_journal_waits_for_reserved_entries_in_order(self) -> None:
         game = FakeGame(host=True)
@@ -696,22 +852,29 @@ class MailboxTest(unittest.TestCase):
             game.frame()
         self.assertEqual([qid for qid, _, _ in game.taken], list(range(1, 71)))
 
-    def test_game_drain_thread_marker_does_not_stop_quest_replay(self) -> None:
+    def test_only_the_drain_thread_makes_replays_and_its_marker_is_not_foreign(self) -> None:
         game = FakeGame(host=False)
         mailbox = cb.Mailbox(game, drain=True, journal=True)
         mailbox.attach()
-        game.mb[0x60:0x68] = (0x123456789ABCDEF0).to_bytes(8, "little")
         mailbox.push([cb.QuestEvent(7, 1, 2).inbox_word()])
-        game.frame()
+        game.frame(during=lambda: game.change(8, 1, 3, thread=OTHER_THREAD))
+        game.change(9, 1, 2)  # on the drain's thread, after the drain returned
+        self.assertEqual(game.u64(cb.MB_DRAIN_TLS), GAME_THREAD)
         self.assertEqual(mailbox.check(), 1)
         self.assertEqual(game.states[7], 2)
+        self.assertEqual(mailbox.read_journal(), [cb.JournalEntry(7, 1, 2, 1), cb.JournalEntry(8, 1, 3, 0),
+                                                  cb.JournalEntry(9, 1, 2, 0)])
 
     def test_a_lost_or_foreign_mailbox_is_detected(self) -> None:
         for name, damage in (("restart", lambda g: g.mb.__setitem__(slice(None), bytes(cb.MAILBOX_SIZE))),
                              ("in_w", lambda g: g.set_u32(cb.MB_IN_W, 3)),
                              ("flags", lambda g: g.set_u32(cb.MB_FLAGS, cb.FLAG_JOURNAL)),
                              ("in_r", lambda g: g.set_u32(cb.MB_IN_R, 1)),
-                             ("spare", lambda g: g.set_u32(0x40, 1))):
+                             ("spare", lambda g: g.set_u32(0x40, 1)),
+                             ("story cursor", lambda g: g.set_u32(cb.MB_STORY_R, 1)),
+                             ("story loss", lambda g: g.set_u32(cb.MB_STORY_LOST, 1)),
+                             ("story reservations", lambda g: g.set_u32(cb.MB_OUT_W, cb.JOURNAL_SLOTS + 1)),
+                             ("spare after the story words", lambda g: g.set_u32(cb.MB_STORY_LOST + 4, 1))):
             with self.subTest(name):
                 game = FakeGame(host=False)
                 mailbox = cb.Mailbox(game, drain=True, journal=True)
@@ -719,6 +882,14 @@ class MailboxTest(unittest.TestCase):
                 mailbox.check()
                 damage(game)
                 with self.assertRaises(cb.MailboxError):
+                    mailbox.check()
+        for offset in (cb.MB_OUT_W, cb.MB_STORY_R, cb.MB_STORY_LOST):
+            with self.subTest(disabled_story_word=hex(offset)):
+                game = FakeGame(host=False)
+                mailbox = cb.Mailbox(game, drain=True, journal=False)
+                mailbox.attach()
+                game.set_u32(offset, 1)
+                with self.assertRaisesRegex(cb.MailboxError, "disabled story"):
                     mailbox.check()
 
 
@@ -838,6 +1009,7 @@ class HostRelayTest(LiveFixture):
         relay = self.host_relay(game)
         relay.start()
         game.change(5, 1, 2)
+        game.set_u64(cb.MB_DRAIN_TLS, GAME_THREAD)  # someone else poses as the host's drain, which is off
         game.set_u32(cb.MB_APPLYING, 1)
         game.change(6, 1, 2)
         game.set_u32(cb.MB_APPLYING, 0)
@@ -847,6 +1019,19 @@ class HostRelayTest(LiveFixture):
         self.assert_stopped(game)
         with self.assertRaises(cb.BridgeError):
             relay.step()
+
+    def test_a_change_committed_out_of_order_is_sent_after_the_one_reserved_before_it(self) -> None:
+        game = FakeGame(host=True)
+        relay = self.host_relay(game)
+        relay.start()
+        first = game.reserve_story(5, 1, 2)
+        game.change(6, 1, 3, thread=OTHER_THREAD)  # reserved and committed while quest 5's entry is not committed
+        relay.step()
+        self.assertEqual((self.contract.events, relay.pending), ([], 0))
+        game.commit_story(first)
+        relay.step()
+        self.assertEqual(self.contract.events, [(5, 1, 2), (6, 1, 3)])
+        self.assertEqual((relay.acked, relay.pending), (2, 0))
 
     def test_journal_overflow_stops_before_anything_is_sent(self) -> None:
         game = FakeGame(host=True)
@@ -1073,6 +1258,21 @@ class GuestRelayTest(LiveFixture):
         with self.assertRaises(cb.GameNotReady):
             self.guest_relay(FakeGame(host=True)).start()
 
+    def test_a_story_journal_loss_or_damage_stops_even_a_replaying_guest(self) -> None:
+        for name, damage in (("loss", lambda g: [g.change(qid, 1, 2) for qid in range(1, 130)]),
+                             ("invalid entry", lambda g: g.forge_story(3 | 1 << 16 | 2 << 20 | 2 << 24)),
+                             ("foreign cursor", lambda g: g.set_u32(cb.MB_STORY_R, 1))):
+            with self.subTest(name):
+                self.setUp()
+                game = FakeGame(host=False)
+                relay = self.guest_relay(game)
+                relay.start()
+                relay.step()
+                damage(game)
+                with self.assertRaises(cb.MailboxError):
+                    relay.step()
+                self.assert_stopped(game)
+
 
 class ProposingGuestRelayTest(LiveFixture):
     """GuestRelay(propose=True) under the server role "guest"."""
@@ -1129,6 +1329,19 @@ class ProposingGuestRelayTest(LiveFixture):
         self.assertEqual(self.held(), [story(5, 1, 2), unique(14, 1, 2, "state", 0)])
         self.assertEqual((relay.replayed, relay.unique_replayed, relay.local_changes, relay.proposed), (2, 3, 1, 2))
         self.assertEqual(self.contract.posts, [])
+
+    def test_another_threads_change_during_a_replay_is_proposed(self) -> None:
+        self.contract.events = [(1, 1, 2)]
+        game = FakeGame(host=False)
+        game.unique_effects[8, 3] = [(14, 1, 2, "state", 0)]
+        relay = self.proposer(game)
+        relay.start()
+        relay.step()
+        game.frame(during=lambda: game.change(8, 1, 3, thread=OTHER_THREAD))
+        relay.step()
+        self.assertEqual(game.states, {1: 2, 8: 3})
+        self.assertEqual(self.held(), [story(8, 1, 3), unique(14, 1, 2, "state", 0)])
+        self.assertEqual((relay.consumed, relay.replayed, relay.local_changes, relay.proposed), (1, 1, 1, 2))
 
     def test_lost_answers_are_resent_with_the_same_numbers_and_content(self) -> None:
         game = FakeGame(host=False)
@@ -1254,8 +1467,7 @@ class ProposingGuestRelayTest(LiveFixture):
         cases = (("story journal overflow", lambda g: [g.change(qid, 1, 2) for qid in range(1, 130)], cb.MailboxError),
                  ("unique journal loss", lambda g: [g.unique_change(11, n % 2, 1 - n % 2, "counter", 4)
                                                     for n in range(cb.UNIQUE_JOURNAL_SLOTS + 1)], cb.MailboxError),
-                 ("unknown story origin", lambda g: (g.set_u32(cb.MB_JOURNAL, 3 | 1 << 16 | 2 << 20 | 2 << 24),
-                                                     g.set_u32(cb.MB_OUT_W, 1)), cb.MailboxError),
+                 ("invalid story entry", lambda g: g.forge_story(3 | 1 << 16 | 2 << 20 | 2 << 24), cb.MailboxError),
                  ("story state 0", lambda g: g.change(3, 0, 2), cb.ResyncRequired),
                  ("state at a counter site", lambda g: g.unique_change(11, 1, 2, "state", 4), cb.ResyncRequired),
                  ("state its site does not write", lambda g: g.unique_change(11, 1, 3, "state", 0), cb.ResyncRequired))
