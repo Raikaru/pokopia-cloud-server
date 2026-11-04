@@ -166,12 +166,14 @@ Matchmaking sessions, creation tickets and Gamesync documents are kept in memory
 The experimental story-co-op journals also live only for a matchmaking session and epoch; restarting
 the server or restarting the host's game loses them. They are not campaign checkpoints.
 `/campaign/live` carries host story-quest transitions. `/campaign/live/proposals` is a separate
-queue for guest changes: it is **not yet connected to the launcher or relays**, and proposals are
-untrusted input, not authoritative events. A host must validate a proposal against its own game
-state and side effects before acting; blindly replaying the bytes can produce incorrect progression.
+queue for guest changes: it is **not connected to the launcher**, only the experimental
+`campaign_bridge.py` guest relay posts to it, and only when explicitly created with `propose=True`.
+Nothing reads or applies the queue on the host yet. Proposals are untrusted input, not
+authoritative events. A host must validate a proposal against its own game state and side effects
+before acting; blindly replaying the bytes can produce incorrect progression.
 Both endpoints require client-certificate authentication and active session membership.
 
-For a future proposal client, POST JSON to `/campaign/live/proposals` with `session`, `epoch`,
+For a proposal client, POST JSON to `/campaign/live/proposals` with `session`, `epoch`,
 `producer`, `first` and `events`. `producer` is a randomly generated, lowercase 32-hex-digit ID
 owned by the posting account for the epoch; `first` is that producer's sequence number, starting
 at 1. A story event has `kind`, `id`, `old`, `new` (`kind` is `story`); a unique-quest event also
@@ -534,9 +536,16 @@ With Python instead of the packaged launcher: `py -3 -m pip install -r requireme
 
 The experimental `campaign_bridge.py` is not connected to this launcher and does not enable shared
 story progression. Its mailbox can read the patched game's unique-quest journal, stopping on lost
-entries or a foreign read cursor; neither relay sends those events yet. Its Windows `GameProcess`
-requires the main address from the **current** emulator process's `user\log\eden_log.txt`. A stale
-address can misdirect guest-memory reads; the alignment check rejects some stale addresses, not all.
+entries or a foreign read cursor. An explicitly enabled guest sender posts changes the patch marks
+as local, but is not a reliable campaign feed: the story journal can misclassify or lose concurrent
+changes, deferred replay effects can appear local, and the story and unique journals do not establish
+a causal order between them. Nothing applies these proposals on the host.
+
+In one real two-client test a guest accepted quest 11 using an additional test-only NOP at
+`main+0x114384`; that broad visitor-eligibility change is not part of the quest patch. The Windows
+`GameProcess` requires the main address from the **current** emulator process's
+`user\log\eden_log.txt`. A stale address can misdirect guest-memory reads; the alignment check
+rejects some stale addresses, not all.
 
 The launcher checks the portal's certificate against the CA bundle of `certifi`, not the Windows certificate store. That store can hold an expired cross-signed intermediate, such as the ISRG Root X2 one that expired in 2025, which makes Python's OpenSSL 1.1.1 reject a certificate that browsers accept.
 
