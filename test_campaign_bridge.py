@@ -460,6 +460,76 @@ class MailboxTest(unittest.TestCase):
         with self.assertRaisesRegex(cb.MailboxError, "while it was read"):
             mailbox.read_journal()
 
+    def test_unique_journal_refuses_an_incompatible_patch_before_writing(self) -> None:
+        game = FakeGame(host=True)
+        game.memory[MAIN + 0x6149F8][0] ^= 1
+        mailbox = cb.Mailbox(game, drain=False, journal=False, unique_journal=True)
+        with self.assertRaises(cb.PatchMismatch):
+            mailbox.attach()
+        self.assertEqual(game.writes, [])
+
+    def test_unique_journal_waits_for_reserved_entries_in_order(self) -> None:
+        game = FakeGame(host=True)
+        mailbox = cb.Mailbox(game, drain=False, journal=True, unique_journal=True)
+        mailbox.attach()
+        game.set_u32(cb.MB_UJ_W, 2)
+        slot = cb.MB_UNIQUE_JOURNAL
+        game.set_u32(slot, 11 | 2 << 8 | 3 << 16 | 2 << 27)
+        game.set_u32(slot + 8, 11 | 3 << 16 | 1 << 24 | 10 << 27)
+        game.set_u32(slot + 12, 2)
+        self.assertEqual(mailbox.read_unique_journal(), [])
+        self.assertEqual(game.u32(cb.MB_UJ_R), 0)
+        game.set_u32(slot + 4, 1)
+        events = mailbox.read_unique_journal()
+        self.assertEqual([(e.sequence, e.id, e.field, e.old, e.new) for e in events],
+                         [(0, 11, "state", 2, 3), (1, 11, "counter", 0, 3)])
+        self.assertEqual(game.u32(cb.MB_UJ_R), 2)
+        self.assertEqual(mailbox.check(), 0)
+
+    def test_unique_journal_loss_during_read_is_not_acknowledged(self) -> None:
+        game = FakeGame(host=True)
+        mailbox = cb.Mailbox(game, drain=False, journal=False, unique_journal=True)
+        mailbox.attach()
+        game.set_u32(cb.MB_UJ_W, 1)
+        game.set_u32(cb.MB_UNIQUE_JOURNAL, 11 | 2 << 8 | 3 << 16 | 2 << 27)
+        game.set_u32(cb.MB_UNIQUE_JOURNAL + 4, 1)
+        original_read = game.read
+
+        def lose_during_read(address: int, size: int) -> bytes:
+            data = original_read(address, size)
+            if address == mailbox.base + cb.MB_UNIQUE_JOURNAL:
+                game.set_u32(cb.MB_UJ_LOST, 1)
+            return data
+
+        game.read = lose_during_read
+        with self.assertRaisesRegex(cb.MailboxError, "lost changes"):
+            mailbox.read_unique_journal()
+        self.assertEqual(game.u32(cb.MB_UJ_R), 0)
+
+    def test_unique_journal_rejects_invalid_records_and_foreign_readers(self) -> None:
+        for damage in ("invalid_record", "foreign_reader"):
+            with self.subTest(damage=damage):
+                game = FakeGame(host=True)
+                mailbox = cb.Mailbox(game, drain=False, journal=False, unique_journal=True)
+                mailbox.attach()
+                if damage == "invalid_record":
+                    game.set_u32(cb.MB_UJ_W, 1)
+                    game.set_u32(cb.MB_UNIQUE_JOURNAL, 2 << 8 | 3 << 16 | 2 << 27)  # id zero
+                    game.set_u32(cb.MB_UNIQUE_JOURNAL + 4, 1)
+                else:
+                    game.set_u32(cb.MB_UJ_R, 1)
+                with self.assertRaises(cb.MailboxError):
+                    mailbox.read_unique_journal()
+
+    def test_reading_unique_journal_preserves_inbox_acknowledgement(self) -> None:
+        game = FakeGame(host=False)
+        mailbox = cb.Mailbox(game, drain=True, journal=True, unique_journal=True)
+        mailbox.attach()
+        mailbox.push([cb.QuestEvent(7, 1, 2).inbox_word()])
+        game.frame()
+        self.assertEqual(mailbox.read_unique_journal(), [])
+        self.assertEqual(mailbox.check(), 1)
+
     def test_inbox_room_and_consumption(self) -> None:
         game = FakeGame(host=False)
         mailbox = cb.Mailbox(game, drain=True, journal=True)
