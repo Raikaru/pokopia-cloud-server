@@ -119,6 +119,53 @@ class SnapshotCancellationTest(unittest.IsolatedAsyncioTestCase):
             proceed.set()
         self.assertTrue(await asyncio.to_thread(closed.wait, 5))
 
+    async def test_cancel_during_payload_read_closes_without_blocking_event_loop(self) -> None:
+        started, proceed, closed = threading.Event(), threading.Event(), threading.Event()
+        lock = threading.Lock()
+
+        class Store:
+            def snapshot(self):
+                return b"{}", [], []
+
+        class File:
+            path, size, sha256 = "map/objects/x", 1, hashlib.sha256(b"x").hexdigest()
+
+            def read(self, offset, size):
+                with lock:
+                    started.set()
+                    proceed.wait(5)
+                    return b"x"
+
+        class Backup:
+            files = (File(),)
+
+            def close(self):
+                with lock:
+                    closed.set()
+
+        class Registry:
+            def capture_backup(self):
+                return Backup()
+
+        class Writer:
+            def write(self, data):
+                pass
+
+            async def drain(self):
+                pass
+
+        task = asyncio.create_task(server.SnapshotService(Store(), Registry()).send(Writer()))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            task.cancel()
+            await asyncio.wait_for(asyncio.sleep(0.01), 1)
+            self.assertFalse(task.done())
+        finally:
+            proceed.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(closed.is_set())
+
 
 @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "snapshots need Linux")
 class SnapshotTest(unittest.TestCase):
