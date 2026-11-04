@@ -506,6 +506,11 @@ Without a command, the launcher runs `play`, which does this, in order, and stop
 
 With Python instead of the packaged launcher: `py -3 -m pip install -r requirements-launcher.txt`, then `py -3 launcher.py play --portal https://pokopia.example.org`. The other commands are `link`, `configure --user-dir <user dir>` (sets up any emulator user directory, such as `%APPDATA%\eden`, as in step 4), `run` (only the gateway) and `status`.
 
+The experimental `campaign_bridge.py` is not connected to this launcher and does not enable shared
+story progression. Its Windows `GameProcess` requires the main address from the **current** emulator
+process's `user\log\eden_log.txt`. A stale address can misdirect guest-memory reads; the alignment
+check rejects some stale addresses, not all of them.
+
 The launcher checks the portal's certificate against the CA bundle of `certifi`, not the Windows certificate store. That store can hold an expired cross-signed intermediate, such as the ISRG Root X2 one that expired in 2025, which makes Python's OpenSSL 1.1.1 reject a certificate that browsers accept.
 
 The launcher keeps its keys in `%LOCALAPPDATA%\PokopiaLauncher`. On Windows they are encrypted with a passphrase that Windows (DPAPI) protects for the current user; elsewhere the directory is mode `0700`. A certificate is valid for 180 days (`portal.py serve --device-days`). Linking again creates a new device; revoke old ones on the portal. Add a backup passkey on the portal: an account with no remaining sign-in method cannot be recovered.
