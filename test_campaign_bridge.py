@@ -1618,7 +1618,8 @@ class ServerContractTest(LiveFixture):
     def test_host_rejects_malformed_proposal_pages(self) -> None:
         view = self.client.discover()
         producer = "f" * 32
-        self.client.propose(SESSION, view.epoch, producer, 1, [cb.Proposal("story", 10, 1, 2)])
+        self.client.propose(SESSION, view.epoch, producer, 1,
+                            [cb.Proposal("story", 10, 1, 2), cb.Proposal("story", 10, 2, 3)])
         self.contract.guest = self.contract.host
         mutations = (
             lambda answer: {**answer, "session": "sessions/other"},
@@ -1626,6 +1627,8 @@ class ServerContractTest(LiveFixture):
             lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "seq": 2}]},
             lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "number": True}]},
             lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "producer": "BAD"}]},
+            lambda answer: {**answer, "proposals": [answer["proposals"][0],
+                                                      {**answer["proposals"][1], "number": 1}]},
             lambda answer: {**answer, "proposals": [{**answer["proposals"][0],
                                                       "event": {"kind": "story", "id": 10, "old": 1, "new": 1}}]},
         )

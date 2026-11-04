@@ -923,7 +923,7 @@ def parse_proposals(obj: dict, session: str, epoch: str, after: int) -> Proposal
     raw = obj["proposals"]
     if not isinstance(raw, list) or len(raw) > MAX_EVENTS_PER_POST:
         raise ProtocolError("the server's proposal page is not a bounded list")
-    proposals = []
+    proposals, producer_numbers = [], {}
     for seq, item in enumerate(raw, after + 1):
         if not isinstance(item, dict) or item.keys() != {"seq", "producer", "number", "event"}:
             raise ProtocolError(f"the server sent a malformed proposal: {item!r}")
@@ -934,6 +934,9 @@ def parse_proposals(obj: dict, session: str, epoch: str, after: int) -> Proposal
             raise ProtocolError(f"the server sent an invalid proposal producer: {producer!r}")
         if type(number) is not int or not 1 <= number <= MAX_SEQ:
             raise ProtocolError(f"the server sent an invalid producer sequence: {number!r}")
+        if producer in producer_numbers and number != producer_numbers[producer] + 1:
+            raise ProtocolError(f"the server's proposal numbers for {producer} are not contiguous")
+        producer_numbers[producer] = number
         if not isinstance(event, dict) or (event.keys() != {"kind", "id", "old", "new"}
                 and event.keys() != {"kind", "id", "old", "new", "field", "site"}):
             raise ProtocolError(f"the server sent a malformed proposal event: {event!r}")
