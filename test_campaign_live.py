@@ -33,6 +33,7 @@ TENANT = "tenants/t-test"
 SESSION_ID = ":K5Y67P9D4Q8V"  # Synthetic host session identifier.
 PASSWORD = "H4N7Q2"
 LIVE = server.CAMPAIGN_LIVE_PATH
+PROPOSALS = server.CAMPAIGN_PROPOSALS_PATH
 
 
 def text(value: str) -> bytes:
@@ -135,6 +136,15 @@ class Bridge:
     async def post(self, session: str, epoch: str, first: int, *events: tuple[int, int, int]) -> tuple[int, dict]:
         body = {"session": session, "epoch": epoch, "first": first, "events": changes(*events)}
         return await self.exchange("POST", LIVE, json.dumps(body).encode(), "application/json")
+
+    async def propose(self, session: str, epoch: str, producer: str, first: int,
+                      *events: dict) -> tuple[int, dict]:
+        body = {"session": session, "epoch": epoch, "producer": producer, "first": first, "events": events}
+        return await self.exchange("POST", PROPOSALS, json.dumps(body).encode(), "application/json")
+
+    async def proposals(self, session: str, epoch: str, after: int) -> tuple[int, dict]:
+        query = urlencode({"session": session, "epoch": epoch, "after": after})
+        return await self.exchange("GET", f"{PROPOSALS}?{query}")
 
     async def exchange(self, method: str, target: str, body: bytes = b"",
                        content_type: str | None = None) -> tuple[int, dict]:
@@ -318,6 +328,99 @@ class CampaignLiveTest(unittest.IsolatedAsyncioTestCase):
         self.assert_error(await self.bridge(self.host).discover(), 404, "ambiguous_session")
         status, state = await self.bridge(self.host).poll(self.session.name, epoch, 0)
         self.assertEqual((status, state["role"]), (200, "host"), state)
+
+    async def test_guest_proposals_are_ordered_idempotent_and_visible_only_to_host(self) -> None:
+        epoch, producer = await self.epoch(), "1" * 32
+        host, guest, stranger = self.bridge(self.host), self.bridge(self.guest), self.bridge(self.stranger)
+        accepted = {"kind": "unique", "id": 11, "field": "state", "old": 2, "new": 3, "site": 2}
+        counter = {"kind": "unique", "id": 11, "field": "counter", "old": 0, "new": 3, "site": 9}
+        story = {"kind": "story", "id": 10, "old": 1, "new": 2}
+        self.assert_error(await stranger.propose(self.session.name, epoch, producer, 1, accepted),
+                          404, "session_gone")
+        self.assert_error(await self.bridge(None).propose(self.session.name, epoch, producer, 1, accepted),
+                          401, "unauthenticated")
+        self.assert_error(await host.propose(self.session.name, epoch, producer, 1, accepted), 403, "not_guest")
+        self.assert_error(await guest.proposals(self.session.name, epoch, 0), 403, "not_host")
+        status, result = await guest.propose(self.session.name, epoch, producer, 1, accepted, counter)
+        self.assertEqual((status, result["added"], result["last"]), (200, 2, 2))
+        status, retry = await guest.propose(self.session.name, epoch, producer, 1, accepted, counter)
+        self.assertEqual((status, retry["added"], retry["last"]), (200, 0, 2))
+        status, overlap = await guest.propose(self.session.name, epoch, producer, 2, counter, story)
+        self.assertEqual((status, overlap["added"], overlap["last"]), (200, 1, 3))
+        self.assert_error(await guest.propose(self.session.name, epoch, producer, 3, accepted, story),
+                          409, "sequence_conflict", first=1, last=3)
+        self.assert_error(await guest.propose(self.session.name, epoch, producer, 5, story),
+                          409, "sequence_gap", first=1, last=3)
+        status, result = await host.proposals(self.session.name, epoch, 0)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["proposals"],
+                         [{"seq": i, "producer": producer, "number": i, "event": event}
+                          for i, event in enumerate((accepted, counter, story), 1)])
+        self.assertEqual((await self.events())["events"], [])  # proposals are not authoritative events
+
+    async def test_guest_proposal_producer_cannot_be_claimed_by_another_account(self) -> None:
+        epoch, producer = await self.epoch(), "a" * 32
+        event = {"kind": "unique", "id": 11, "field": "state", "old": 2, "new": 3, "site": 2}
+        self.assertEqual((await self.bridge(self.guest).propose(self.session.name, epoch, producer, 1, event))[0], 200)
+        self.stranger.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.stranger.join(self.session)
+        self.assert_error(await self.bridge(self.stranger).propose(self.session.name, epoch, producer, 2, event),
+                          403, "producer_owned")
+        other = "d" * 32
+        self.assertEqual((await self.bridge(self.stranger).propose(self.session.name, epoch, other, 1, event))[0], 200)
+        status, state = await self.bridge(self.host).proposals(self.session.name, epoch, 0)
+        self.assertEqual((status, [(p["seq"], p["producer"], p["number"]) for p in state["proposals"]]),
+                         (200, [(1, producer, 1), (2, other, 1)]))
+
+    async def test_guest_proposal_eviction_and_epoch_changes_fail_closed(self) -> None:
+        with mock.patch.object(server, "MAX_LIVE_EVENTS", 3):
+            epoch, producer = await self.epoch(), "b" * 32
+            host, guest = self.bridge(self.host), self.bridge(self.guest)
+            events = [{"kind": "story", "id": i, "old": 1, "new": 2} for i in range(1, 5)]
+            self.assertEqual((await guest.propose(self.session.name, epoch, producer, 1, *events))[0], 200)
+            self.assert_error(await host.proposals(self.session.name, epoch, 0), 409, "cursor_expired",
+                              first=2, last=4)
+            self.assert_error(await guest.propose(self.session.name, epoch, producer, 1, events[0]),
+                              409, "sequence_expired", first=2, last=4)
+            status, state = await host.proposals(self.session.name, epoch, 1)
+            self.assertEqual((status, [p["event"] for p in state["proposals"]]), (200, events[1:]))
+            self.backend.drop_user_session(self.session, self.host.user)
+            self.assert_error(await guest.propose(self.session.name, epoch, producer, 5, events[0]),
+                              409, "host_absent")
+            self.host.join(self.session)
+            new_epoch = await self.epoch()
+            self.assertNotEqual(new_epoch, epoch)
+            self.assert_error(await host.proposals(self.session.name, epoch, 0), 409, "stale_epoch")
+            status, state = await host.proposals(self.session.name, new_epoch, 0)
+            self.assertEqual((status, state["first"], state["last"], state["proposals"]), (200, 1, 0, []))
+
+    async def test_producer_limit_preserves_existing_retry_history(self) -> None:
+        with mock.patch.object(server, "MAX_LIVE_PRODUCERS", 1):
+            epoch = await self.epoch()
+            guest, host = self.bridge(self.guest), self.bridge(self.host)
+            event = {"kind": "story", "id": 11, "old": 1, "new": 2}
+            self.assertEqual((await guest.propose(self.session.name, epoch, "1" * 32, 1, event))[0], 200)
+            self.assert_error(await guest.propose(self.session.name, epoch, "2" * 32, 1, event),
+                              429, "too_many_producers")
+            status, retry = await guest.propose(self.session.name, epoch, "1" * 32, 1, event)
+            self.assertEqual((status, retry["added"]), (200, 0))
+            status, state = await host.proposals(self.session.name, epoch, 0)
+            self.assertEqual((status, state["last"]), (200, 1))
+
+    async def test_guest_proposals_reject_invalid_writer_and_batch_atomically(self) -> None:
+        epoch, producer = await self.epoch(), "c" * 32
+        host, guest = self.bridge(self.host), self.bridge(self.guest)
+        valid = {"kind": "unique", "id": 11, "field": "state", "old": 2, "new": 3, "site": 2}
+        for bad in ({**valid, "site": 1}, {**valid, "id": 201}, {**valid, "new": True},
+                    {**valid, "field": "counter"}, {**valid, "extra": 1}):
+            with self.subTest(bad=bad):
+                self.assert_error(await guest.propose(self.session.name, epoch, producer, 1, valid, bad),
+                                  400, "bad_request")
+        self.assert_error(await guest.propose(self.session.name, epoch, "not-a-producer", 1, valid),
+                          400, "bad_request")
+        status, state = await host.proposals(self.session.name, epoch, 0)
+        self.assertEqual((status, state["last"], state["proposals"]), (200, 0, []))
+        self.assertEqual((await guest.propose(self.session.name, epoch, producer, 1, valid))[0], 200)
 
     # Ordering
 
