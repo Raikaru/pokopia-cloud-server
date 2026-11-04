@@ -4693,6 +4693,7 @@ def advertised_stun(args: argparse.Namespace) -> str:
 # --- Backup snapshots -------------------------------------------------------------------------
 
 SNAPSHOT_PROTOCOL = b"pokopia-snapshot 1"
+SNAPSHOT_CAMPAIGN_PROTOCOL = b"pokopia-snapshot 2"
 SNAPSHOT_CHUNK_SIZE = 256 * 1024
 # A snapshot client that takes no data for this long is dropped, closing the blobs held open for it.
 # It is generous because the client may be streaming into a slow upload.
@@ -4702,8 +4703,8 @@ SNAPSHOT_STALL_SECONDS = 300
 class SnapshotService:
     """Serves backup snapshots of the store over a Unix socket (--snapshot-socket, Linux only).
 
-    A client that connects gets the status line "pokopia-snapshot 1 ok", "pokopia-snapshot 1 busy"
-    or "pokopia-snapshot 1 denied". After "ok" comes a tar stream: data/state.json,
+    A client gets "pokopia-snapshot 1" or, with campaigns, "pokopia-snapshot 2", followed by
+    "ok", "busy" or "denied". After "ok" comes a tar stream: data/state.json,
     data/blobs/<id> for each blob that state refers to, and last snapshot.json with the size and
     SHA-256 of each file and "damaged_blobs": every referenced blob whose file is missing or not the
     size the state records. Store.snapshot captures those files at one moment. If a campaign registry
@@ -4715,6 +4716,7 @@ class SnapshotService:
     def __init__(self, store: Store, campaigns: campaign_store.CampaignRegistry | None = None):
         self.store = store
         self.campaigns = campaigns
+        self.protocol = SNAPSHOT_CAMPAIGN_PROTOCOL if campaigns is not None else SNAPSHOT_PROTOCOL
         self.busy = False
 
     async def on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -4724,9 +4726,9 @@ class SnapshotService:
             _, uid, _ = struct.unpack("3i", credentials)
             if uid not in (0, os.geteuid()):
                 log.warning("snapshot refused to uid %d", uid)
-                writer.write(SNAPSHOT_PROTOCOL + b" denied\n")
+                writer.write(self.protocol + b" denied\n")
             elif self.busy:
-                writer.write(SNAPSHOT_PROTOCOL + b" busy\n")
+                writer.write(self.protocol + b" busy\n")
             else:
                 self.busy = True
                 try:
@@ -4782,7 +4784,7 @@ class SnapshotService:
                 await put(bytes(-size % tarfile.BLOCKSIZE))
                 files[name] = {"size": size, "sha256": digest.hexdigest()}
 
-            writer.write(SNAPSHOT_PROTOCOL + b" ok\n")
+            writer.write(self.protocol + b" ok\n")
             await add("data/state.json", len(state), lambda offset, n: state[offset : offset + n])
             for blob_id, fd, size in blobs:
                 await add(f"data/blobs/{blob_id}", size, lambda offset, n, fd=fd: os.pread(fd, n, offset))

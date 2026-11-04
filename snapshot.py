@@ -16,6 +16,9 @@ size, or does not hash to its name. A server that sends campaign files must incl
 `campaign_inventory` in its manifest: a map from each captured `data/campaigns/...` path to its
 size and SHA-256, collected from the registry capture before streaming. The archive preserves and
 checks it independently of the stream's file list, so whole omitted files are detected too.
+Protocol 2 requires the inventory even when no campaign files arrive; protocol 1 remains readable
+for older servers. The archive records protocol 2, but cannot authenticate its own manifest: if
+both that marker and the inventory are deliberately removed, it is indistinguishable from legacy.
 Checking campaign files needs campaign_store.py beside snapshot.py; a snapshot without them does not.
 --file adds a file, --dir adds the files of a directory, and --sqlite adds an SQLite database,
 copied with SQLite's backup API in one read transaction, so the copy is
@@ -53,6 +56,7 @@ if TYPE_CHECKING:
     import campaign_store  # imported when needed (CampaignFiles.parsers): a snapshot may go without it
 
 PROTOCOL = b"pokopia-snapshot 1"
+CAMPAIGN_PROTOCOL = b"pokopia-snapshot 2"
 # A campaign ID as campaign_store.py accepts it: 1-64 of a-z, 0-9, _ and -, starting with a letter or
 # digit, and not a Windows device name.
 CAMPAIGN_ID = r"(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?![a-z0-9_-]))[a-z0-9][a-z0-9_-]{0,63}"
@@ -233,12 +237,12 @@ def check_manifest(manifest: dict | None, files: dict[str, dict]) -> None:
         raise RuntimeError(f"the server's data is damaged: {'; '.join(manifest.get('damaged_blobs') or ['?'])}")
 
 
-def check_campaign_inventory(manifest: dict, files: dict[str, dict]) -> None:
+def check_campaign_inventory(manifest: dict, files: dict[str, dict], *, required: bool = False) -> None:
     """Compare streamed campaign files with the independently captured server inventory."""
     actual = {name: info for name, info in files.items() if CAMPAIGN_PATH.fullmatch(name)}
     inventory = manifest.get("campaign_inventory")
     if inventory is None:
-        if actual:
+        if required or actual:
             raise RuntimeError("campaign files lack the server's captured inventory")
     elif not isinstance(inventory, dict) or inventory != actual:
         raise RuntimeError("campaign files do not match the server's captured inventory")
@@ -250,8 +254,9 @@ def snapshot(args: argparse.Namespace, output) -> None:
         connection.connect(str(args.socket))
         stream = connection.makefile("rb")
         status = stream.readline(100).rstrip(b"\n")
-        if status != PROTOCOL + b" ok":
+        if status not in (PROTOCOL + b" ok", CAMPAIGN_PROTOCOL + b" ok"):
             raise RuntimeError(f"the server answered {status.decode('ascii', 'replace')!r}")
+        campaign_protocol = status == CAMPAIGN_PROTOCOL + b" ok"
 
         archive = tarfile.open(fileobj=output, mode="w|gz", format=tarfile.PAX_FORMAT)
         files: dict[str, dict] = {}
@@ -279,7 +284,7 @@ def snapshot(args: argparse.Namespace, output) -> None:
             pass
     check_manifest(manifest, files)
     campaigns.finish()
-    check_campaign_inventory(manifest, files)
+    check_campaign_inventory(manifest, files, required=campaign_protocol)
 
     extras_time = time.time()
     for name, path in args.file:
@@ -295,6 +300,8 @@ def snapshot(args: argparse.Namespace, output) -> None:
 
     summary = {"format": 1, "server_time": manifest["created"], "extras_time": extras_time,
                "files": files, "damaged_blobs": []}
+    if campaign_protocol:
+        summary["server_snapshot_protocol"] = 2
     if "campaign_inventory" in manifest:
         summary["campaign_inventory"] = manifest["campaign_inventory"]
     add(archive, {}, "snapshot.json", json.dumps(summary, indent=1).encode(), time.time())
@@ -327,7 +334,10 @@ def check(path: Path, required: list[str]) -> None:
             campaigns.add(member.name, member.size, files[member.name]["sha256"], document)
     check_manifest(manifest, files)
     campaigns.finish()
-    check_campaign_inventory(manifest, files)
+    protocol = manifest.get("server_snapshot_protocol")
+    if protocol is not None and (type(protocol) is not int or protocol != 2):
+        raise RuntimeError(f"unsupported server snapshot protocol {protocol!r}")
+    check_campaign_inventory(manifest, files, required=protocol == 2)
     check_required(files, required)
     for name, info in sorted(files.items()):
         print(f"{info['sha256']}  {name}")
