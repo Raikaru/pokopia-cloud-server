@@ -1,9 +1,11 @@
 """Tests of campaign_bridge, the live quest event transport: event order, loss, retries and fail-closed stops.
 
 The relays run against a simulated patched game: the patch bytes, the capability mask, and a mailbox whose
-game side behaves like caves J and D. They talk over real TLS with client certificates to a test double of
-/campaign/live, which is written from the shared contract and not taken from server.py. On Windows,
-GameProcess also attaches to a child process laid out like the game.
+game side behaves like caves J and D and the unique-quest journal. They talk over real TLS with client
+certificates to a test double of /campaign/live and /campaign/live/proposals, which is written from the shared
+contract and not taken from server.py; ServerContractTest puts server.py's own CampaignLive behind the same
+transport when server.py's dependencies are installed. On Windows, GameProcess also attaches to a child
+process laid out like the game.
 
     .\\.venv\\Scripts\\python.exe -m unittest test_campaign_bridge
 """
@@ -22,10 +24,11 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -68,6 +71,8 @@ class FakeGame:
         self.writes: list[tuple[int, bytes]] = []  # (mailbox offset, data) the relay wrote
         self.exited = False
         self.on_journal_read: Callable[[], None] | None = None
+        # (story quest, new state) -> the unique changes (id, old, new, field, site) its writer makes as well
+        self.unique_effects: dict[tuple[int, int], list[tuple[int, int, int, str, int]]] = {}
 
     @property
     def mb(self) -> bytearray:
@@ -109,7 +114,7 @@ class FakeGame:
         return self.u32(cb.MB_MAGIC) == cb.MAGIC and bool(self.u32(cb.MB_FLAGS) & flag)
 
     def set_quest(self, qid: int, new: int) -> None:
-        """The game's quest state setter with cave J around it."""
+        """The game's quest state setter with cave J around it, and the unique changes it makes with it."""
         old = self.states.get(qid, 1)
         self.states[qid] = new
         if self.armed(cb.FLAG_JOURNAL) and old != new and 1 <= new <= 4 and 1 <= qid <= 1000:
@@ -117,6 +122,26 @@ class FakeGame:
             word = qid | (old & 0xF) << 16 | new << 20 | (self.u32(cb.MB_APPLYING) & 1) << 24
             self.set_u32(cb.MB_JOURNAL + 4 * (w % cb.JOURNAL_SLOTS), word)
             self.set_u32(cb.MB_OUT_W, w + 1)
+        if old != new:
+            for effect in self.unique_effects.get((qid, new), ()):
+                self.unique_change(*effect)
+
+    def unique_change(self, qid: int, old: int, new: int, field: str, site: int, origin: int | None = None) -> None:
+        """A unique-quest byte write with the patch's unique journal around its writer: origin 2 (a side effect
+        on the drain thread) while the drain applies an entry, else 0, unless given. A reservation is counted
+        before its entry is committed; a full ring drops the change and counts it as lost."""
+        if not self.armed(cb.FLAG_UNIQUE_JOURNAL):
+            return
+        if origin is None:
+            origin = 2 if self.u32(cb.MB_APPLYING) else 0
+        w = self.u32(cb.MB_UJ_W)
+        if w - self.u32(cb.MB_UJ_R) >= cb.UNIQUE_JOURNAL_SLOTS:
+            self.set_u32(cb.MB_UJ_LOST, self.u32(cb.MB_UJ_LOST) + 1)
+            return
+        slot = cb.MB_UNIQUE_JOURNAL + 8 * (w % cb.UNIQUE_JOURNAL_SLOTS)
+        self.set_u32(cb.MB_UJ_W, w + 1)
+        self.set_u32(slot, qid | old << 8 | new << 16 | (field == "counter") << 24 | origin << 25 | site << 27)
+        self.set_u32(slot + 4, w + 1)
 
     def change(self, qid: int, old: int, new: int) -> None:
         """A quest change the game makes itself."""
@@ -173,9 +198,11 @@ def error(status: int, code: str, **extra: object) -> tuple[int, dict]:
 
 class Contract:
     """/campaign/live from the shared contract: a bounded journal per session and epoch, 409 for stale epochs,
-    for cursors outside the retained history, and for sequence gaps, conflicts or expiry."""
+    for cursors outside the retained history, and for sequence gaps, conflicts or expiry. POST
+    /campaign/live/proposals takes guest proposals into a bounded journal of its own, numbered per producer,
+    with the same 409s, 409 host_absent while the creator is away and 429 past the producer limit."""
 
-    RETAIN, PAGE = 1024, 64
+    RETAIN, PAGE, PRODUCERS = 1024, 64, 64
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -183,12 +210,22 @@ class Contract:
         self.base = 0  # seqs 1..base were discarded
         self.events: list[tuple[int, int, int]] = []
         self.posts: list[dict] = []
+        self.host_present = True
+        self.proposal_base = 0  # proposals 1..proposal_base were discarded
+        self.proposals: list[tuple[str, int, dict]] = []  # (producer, number, event), in the shared order
+        self.producers: dict[str, int] = {}  # producer -> its newest number
+        self.proposal_posts: list[dict] = []
         self.requests: list[tuple[str, str, str | None]] = []  # method, target, Host header
-        self.faults: list[tuple[str, str]] = []  # (method or "*", kind), each used by one request
+        # (method or "*", kind or a function that rewrites the answer), each used by one request
+        self.faults: list[tuple[str, str | Callable[[dict], object]]] = []
 
     @property
     def last(self) -> int:
         return self.base + len(self.events)
+
+    @property
+    def proposal_last(self) -> int:
+        return self.proposal_base + len(self.proposals)
 
     def view(self, events: list[dict] | None = None) -> dict:
         result = {"session": self.session, "epoch": self.epoch, "role": self.role, "first": self.base + 1,
@@ -197,15 +234,17 @@ class Contract:
             result["events"] = events
         return result
 
-    def fault(self, method: str) -> str | None:
+    def fault(self, method: str) -> str | Callable[[dict], object] | None:
         for index, (wanted, kind) in enumerate(self.faults):
             if wanted in (method, "*"):
                 del self.faults[index]
                 return kind
         return None
 
-    def handle(self, method: str, target: str, body: bytes) -> tuple[int, dict]:
+    def handle(self, method: str, target: str, body: bytes, content_type: str | None = None) -> tuple[int, dict]:
         url = urlsplit(target)
+        if url.path == cb.PROPOSALS_PATH and method == "POST":
+            return self.propose(body, content_type)
         if url.path != cb.LIVE_PATH:
             return error(404, "not_found")
         if method == "GET":
@@ -250,6 +289,43 @@ class Contract:
             del self.events[:dropped]
         return 200, self.view()
 
+    def propose(self, body: bytes, content_type: str | None) -> tuple[int, dict]:
+        if content_type != "application/json":
+            return error(415, "unsupported_media_type")
+        request = json.loads(body)
+        self.proposal_posts.append(request)
+        bounds = {"first": self.proposal_base + 1, "last": self.proposal_last}
+        if request["session"] != self.session:
+            return error(404, "session_gone")
+        if self.role == "host":
+            return error(403, "not_guest")
+        if not self.host_present:
+            return error(409, "host_absent")
+        if request["epoch"] != self.epoch:
+            return error(409, "stale_epoch")
+        producer, first, events = request["producer"], request["first"], request["events"]
+        if producer not in self.producers and len(self.producers) >= self.PRODUCERS:
+            return error(429, "too_many_producers")
+        last = self.producers.get(producer, 0)
+        if first > last + 1:
+            return error(409, "sequence_gap", **bounds)
+        kept = {(owner, number): event for owner, number, event in self.proposals}
+        overlap = min(len(events), last - first + 1)
+        for number, event in enumerate(events[:overlap], first):
+            if (producer, number) not in kept:
+                return error(409, "sequence_expired", **bounds)
+            if kept[producer, number] != event:
+                return error(409, "sequence_conflict", **bounds)
+        additions = events[overlap:]
+        self.proposals += [(producer, number, event) for number, event in enumerate(additions, first + overlap)]
+        if len(self.proposals) > self.RETAIN:
+            dropped = len(self.proposals) - self.RETAIN
+            self.proposal_base += dropped
+            del self.proposals[:dropped]
+        self.producers[producer] = max(last, first + len(events) - 1)
+        return 200, {"session": self.session, "epoch": self.epoch, "first": self.proposal_base + 1,
+                     "last": self.proposal_last, "added": len(additions)}
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -275,7 +351,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind == "unavailable":
                 status, answer = error(503, "unavailable")
             else:
-                status, answer = contract.handle(method, self.path, body)
+                status, answer = contract.handle(method, self.path, body, self.headers.get("Content-Type"))
             if kind == "drop_after":
                 self.close_connection = True
                 return
@@ -283,6 +359,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 answer["events"].reverse()
             if kind == "gap":
                 del answer["events"][0]
+            if callable(kind):
+                answer = kind(answer)
         payload = b'{"session": "a", "session": "b"}' if kind == "garbage" else json.dumps(answer).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -298,6 +376,45 @@ class LiveServer(http.server.ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.contract = Contract()
         self.socket = context.wrap_socket(self.socket, server_side=True)
+
+
+class SessionBackend:
+    """What server.CampaignLive asks of its Backend: the game sessions, and the account that owns each user."""
+
+    def __init__(self, sessions: dict[str, object], owners: dict[str, str]) -> None:
+        self.sessions, self.owners = sessions, owners
+
+    def prune_sessions(self) -> None:
+        pass
+
+    def owns(self, call: object, user: str) -> bool:
+        return self.owners.get(user) == call.principal.account
+
+
+class ServerContract(Contract):
+    """server.py's own CampaignLive behind the TLS double, serving one game session that the host account's
+    user created and the guest account's user joined. Requests over TLS come from the guest account; call()
+    makes them as either account."""
+
+    def __init__(self, server: types.ModuleType) -> None:
+        super().__init__()
+        self.users = {"users/host": types.SimpleNamespace(name="userSessions/host"),
+                      "users/guest": types.SimpleNamespace(name="userSessions/guest")}
+        self.game_session = types.SimpleNamespace(name=SESSION, creator="users/host", user_sessions=self.users,
+                                                  live=None)
+        backend = SessionBackend({SESSION: self.game_session}, {"users/host": "acct-host", "users/guest": "acct-guest"})
+        self.live = server.CampaignLive(backend)
+        self.host = server.Principal("acct-host", "dev-host")
+        self.guest = server.Principal("acct-guest", "dev-guest")
+
+    def handle(self, method: str, target: str, body: bytes, content_type: str | None = None) -> tuple[int, dict]:
+        return self.call(self.guest, method, target, body, content_type)
+
+    def call(self, principal: object, method: str, target: str, body: bytes = b"",
+             content_type: str | None = None) -> tuple[int, dict]:
+        headers = {"content-type": content_type} if content_type is not None else {}
+        result = self.live.handle(method, target, headers, body, principal)
+        return result.status, json.loads(result.body)
 
 
 def issue(name: str, key: ec.EllipticCurvePrivateKey, issuer: x509.Name, issuer_key: ec.EllipticCurvePrivateKey,
@@ -398,6 +515,16 @@ def pump(relay: cb.GuestRelay, game: FakeGame, done: Callable[[], bool], limit: 
     raise AssertionError("the guest relay did not finish")
 
 
+def story(qid: int, old: int, new: int) -> dict:
+    """A story proposal as the contract carries it."""
+    return {"kind": "story", "id": qid, "old": old, "new": new}
+
+
+def unique(qid: int, old: int, new: int, field: str, site: int) -> dict:
+    """A unique-quest proposal as the contract carries it."""
+    return {"kind": "unique", "id": qid, "old": old, "new": new, "field": field, "site": site}
+
+
 # --- Tests -----------------------------------------------------------------------------------------------------
 
 class PatchTest(unittest.TestCase):
@@ -428,6 +555,31 @@ class QuestEventTest(unittest.TestCase):
         for old, new in ((2, 1), (4, 1), (4, 3), (3, 2)):
             with self.subTest(old=old, new=new), self.assertRaises(cb.ResyncRequired):
                 cb.QuestEvent(7, old, new).inbox_word()
+
+
+class ProposalTest(unittest.TestCase):
+    def test_contract_limits(self) -> None:
+        for fields in (("story", 1000, 4, 1), ("unique", 11, 0, 2, "state", 0), ("unique", 11, 3, 4, "state", 1),
+                       ("unique", 11, 5, 3, "state", 2), ("unique", 11, 4, 5, "state", 3),
+                       ("unique", 200, 255, 0, "counter", 13), ("unique", 1, 0, 1, "counter", 4)):
+            with self.subTest(fields=fields):
+                expected = story(*fields[1:]) if fields[0] == "story" else unique(*fields[1:])
+                self.assertEqual(cb.Proposal(*fields).payload(), expected)
+        for fields in (("story", 3, 1, 2, "state", 0), ("story", 3, 2, 2), ("story", 1001, 1, 2), ("other", 3, 1, 2),
+                       ("unique", 201, 0, 1, "counter", 4), ("unique", 0, 0, 1, "counter", 4),
+                       ("unique", 11, 1, 1, "counter", 4), ("unique", 11, 0, 256, "counter", 4),
+                       ("unique", 11, 6, 2, "state", 0), ("unique", 11, 1, 3, "state", 0),
+                       ("unique", 11, 1, 2, "counter", 0), ("unique", 11, 1, 2, "state", 4),
+                       ("unique", 11, 1, 2, "counter", 14), ("unique", 11, 1, 2, "state", 15),
+                       ("unique", 11, True, 2, "counter", 4), ("unique", 11, 1, 2, "counter", 4.0),
+                       ("unique", 11, 1, 2, None, None)):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                cb.Proposal(*fields)
+
+    def test_journal_entries_keep_their_kind(self) -> None:
+        self.assertEqual(cb.Proposal.of(cb.JournalEntry(3, 1, 2, 0)), cb.Proposal("story", 3, 1, 2))
+        entry = cb.UniqueJournalEntry(0, 11, "counter", 0, 3, 0, 10)
+        self.assertEqual(cb.Proposal.of(entry), cb.Proposal("unique", 11, 0, 3, "counter", 10))
 
 
 class MailboxTest(unittest.TestCase):
@@ -627,6 +779,43 @@ class LiveClientTest(LiveFixture):
         with self.assertRaises(cb.LiveUnavailable):
             self.client.discover()
 
+    def test_proposals_are_posted_as_one_batch_of_one_producer(self) -> None:
+        self.contract.role = "guest"
+        producer = "0123456789abcdef" * 2
+        batch = [cb.Proposal("story", 3, 1, 2), cb.Proposal("unique", 11, 0, 3, "counter", 10)]
+        self.assertEqual(self.client.propose(SESSION, EPOCH, producer, 1, batch), cb.ProposalReceipt(1, 2, 2))
+        self.assertEqual(self.client.propose(SESSION, EPOCH, producer, 1, batch), cb.ProposalReceipt(1, 2, 0))
+        self.assertEqual([request[:2] for request in self.contract.requests], [("POST", cb.PROPOSALS_PATH)] * 2)
+        self.assertEqual(self.contract.proposal_posts[0], {"session": SESSION, "epoch": EPOCH, "producer": producer,
+                                                           "first": 1, "events": [story(3, 1, 2),
+                                                                                  unique(11, 0, 3, "counter", 10)]})
+        for first, proposals, code in ((2, [cb.Proposal("story", 3, 1, 4)], "sequence_conflict"),
+                                       (4, batch, "sequence_gap")):
+            with self.subTest(code), self.assertRaises(cb.LiveConflict) as caught:
+                self.client.propose(SESSION, EPOCH, producer, first, proposals)
+            self.assertEqual(caught.exception.code, code)
+        self.contract.role = "host"
+        with self.assertRaises(cb.LiveRefused) as caught:
+            self.client.propose(SESSION, EPOCH, producer, 3, batch)
+        self.assertEqual((caught.exception.status, caught.exception.code), (403, "not_guest"))
+        self.assertEqual(self.contract.producers, {producer: 2})
+
+    def test_proposal_posts_outside_the_contract_are_never_sent(self) -> None:
+        producer, batch = "a" * 32, [cb.Proposal("story", 3, 1, 2)]
+        for name, args in (("uppercase producer", (SESSION, EPOCH, "A" * 32, 1, batch)),
+                           ("short producer", (SESSION, EPOCH, "a" * 31, 1, batch)),
+                           ("no producer", (SESSION, EPOCH, None, 1, batch)),
+                           ("first 0", (SESSION, EPOCH, producer, 0, batch)),
+                           ("boolean first", (SESSION, EPOCH, producer, True, batch)),
+                           ("exhausted", (SESSION, EPOCH, producer, cb.MAX_SEQ, batch * 2)),
+                           ("empty", (SESSION, EPOCH, producer, 1, [])),
+                           ("too many", (SESSION, EPOCH, producer, 1, batch * 65)),
+                           ("not proposals", (SESSION, EPOCH, producer, 1, [cb.QuestEvent(3, 1, 2)])),
+                           ("bad epoch", (SESSION, "bad epoch", producer, 1, batch))):
+            with self.subTest(name), self.assertRaises(ValueError):
+                self.client.propose(*args)
+        self.assertEqual(self.contract.requests, [])
+
 
 class HostRelayTest(LiveFixture):
     def test_sends_the_host_changes_in_game_order_after_the_server_journal(self) -> None:
@@ -792,10 +981,13 @@ class GuestRelayTest(LiveFixture):
         game = FakeGame(host=False)
         relay = self.guest_relay(game)
         relay.start()
+        self.assertEqual(game.u32(cb.MB_FLAGS), cb.FLAG_DRAIN | cb.FLAG_JOURNAL)  # no unique journal by default
+        self.assertIsNone(relay.producer)
         pump(relay, game, lambda: relay.consumed == 1)
         game.change(3, 1, 2)
         relay.step()
         self.assertEqual((relay.replayed, relay.local_changes), (1, 1))
+        self.assertEqual((relay.proposed, relay.proposals_pending), (0, 0))
         self.assertEqual(self.contract.events, [(1, 1, 2)])
         self.assertEqual({method for method, _, _ in self.contract.requests}, {"GET"})
 
@@ -882,6 +1074,258 @@ class GuestRelayTest(LiveFixture):
             self.guest_relay(FakeGame(host=True)).start()
 
 
+class ProposingGuestRelayTest(LiveFixture):
+    """GuestRelay(propose=True) under the server role "guest"."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.contract.role = "guest"
+
+    def proposer(self, game: FakeGame, **options: object) -> cb.GuestRelay:
+        return self.guest_relay(game, propose=True, **options)
+
+    def held(self) -> list[dict]:
+        """The proposals the server holds, in its shared order."""
+        return [event for _, _, event in self.contract.proposals]
+
+    def test_sends_the_guest_games_own_story_and_unique_changes(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.proposer(game, proposal_batch=2)
+        relay.start()
+        self.assertEqual(game.u32(cb.MB_FLAGS), cb.FLAG_DRAIN | cb.FLAG_JOURNAL | cb.FLAG_UNIQUE_JOURNAL)
+        game.change(3, 1, 2)
+        game.unique_change(11, 1, 2, "state", 0)
+        game.change(3, 2, 4)
+        game.unique_change(11, 0, 3, "counter", 10)
+        game.unique_change(12, 3, 4, "state", 1)
+        for _ in range(3):
+            relay.step()
+        # each ring in its own order, story first: the numbers give no order between the two rings
+        self.assertEqual(self.held(), [story(3, 1, 2), story(3, 2, 4), unique(11, 1, 2, "state", 0),
+                                       unique(11, 0, 3, "counter", 10), unique(12, 3, 4, "state", 1)])
+        self.assertEqual([(producer, number) for producer, number, _ in self.contract.proposals],
+                         [(relay.producer, number) for number in range(1, 6)])
+        self.assertEqual([(post["first"], len(post["events"])) for post in self.contract.proposal_posts],
+                         [(1, 2), (3, 2), (5, 1)])
+        self.assertTrue(all(post.keys() == {"session", "epoch", "producer", "first", "events"}
+                            for post in self.contract.proposal_posts))
+        self.assertEqual((relay.proposed, relay.proposals_pending, relay.local_changes), (5, 0, 2))
+        self.assertEqual(self.contract.posts, [])  # never an authoritative event
+
+    def test_replays_and_drain_side_effects_are_never_proposed(self) -> None:
+        self.contract.events = [(1, 1, 2), (2, 1, 4)]
+        game = FakeGame(host=False)
+        game.unique_effects[1, 2] = [(11, 1, 2, "state", 0)]
+        game.unique_effects[2, 4] = [(12, 0, 1, "counter", 7)]
+        game.unique_effects[5, 2] = [(14, 1, 2, "state", 0)]
+        relay = self.proposer(game)
+        relay.start()
+        pump(relay, game, lambda: relay.consumed == 2)
+        relay.step()
+        game.unique_change(13, 4, 5, "state", 15, origin=1)  # a uniqueCas replay
+        game.change(5, 1, 2)  # the guest's own change, and the unique change its writer makes with it
+        relay.step()
+        self.assertEqual(game.states, {1: 2, 2: 4, 5: 2})
+        self.assertEqual(self.held(), [story(5, 1, 2), unique(14, 1, 2, "state", 0)])
+        self.assertEqual((relay.replayed, relay.unique_replayed, relay.local_changes, relay.proposed), (2, 3, 1, 2))
+        self.assertEqual(self.contract.posts, [])
+
+    def test_lost_answers_are_resent_with_the_same_numbers_and_content(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.proposer(game, proposal_batch=2)
+        relay.start()
+        self.contract.faults = [("POST", "drop_after"), ("POST", "drop_after"), ("POST", "drop_before"),
+                                ("POST", "unavailable")]
+        game.change(1, 1, 2)
+        game.change(2, 1, 2)
+        game.unique_change(11, 1, 2, "state", 0)
+        relay.step()
+        self.assertEqual((relay.proposed, relay.proposals_pending), (0, 3))
+        game.change(1, 2, 3)
+        for _ in range(8):
+            relay.step()
+        self.assertEqual(self.held(), [story(1, 1, 2), story(2, 1, 2), unique(11, 1, 2, "state", 0), story(1, 2, 3)])
+        self.assertEqual((relay.proposed, relay.proposals_pending, self.contract.faults), (4, 0, []))
+        self.assertEqual(self.contract.producers, {relay.producer: 4})
+        sent: dict[int, tuple[str, list]] = {}
+        for post in self.contract.proposal_posts:
+            self.assertEqual(sent.setdefault(post["first"], (post["producer"], post["events"])),
+                             (post["producer"], post["events"]))
+        self.assertEqual(sorted(sent), [1, 3])
+        self.assertEqual([target for method, target, _ in self.contract.requests if method == "POST"],
+                         [cb.PROPOSALS_PATH] * 6)
+
+    def test_numbers_belong_to_the_producer_not_to_the_shared_journal(self) -> None:
+        other = "f" * 32
+        self.contract.proposals = [(other, number, story(9, 1, 2)) for number in range(1, 6)]
+        self.contract.producers = {other: 5}
+        game = FakeGame(host=False)
+        relay = self.proposer(game)
+        relay.start()
+        game.change(3, 1, 2)
+        relay.step()
+        self.contract.proposals.append((other, 6, story(9, 2, 3)))
+        self.contract.producers[other] = 6
+        game.change(3, 2, 3)
+        relay.step()
+        self.assertEqual([(post["producer"], post["first"]) for post in self.contract.proposal_posts],
+                         [(relay.producer, 1), (relay.producer, 2)])
+        self.assertEqual(self.contract.proposals[5:], [(relay.producer, 1, story(3, 1, 2)), (other, 6, story(9, 2, 3)),
+                                                       (relay.producer, 2, story(3, 2, 3))])
+        self.assertEqual(relay.proposed, 2)
+        second = self.proposer(FakeGame(host=False))
+        self.assertNotEqual(second.producer, relay.producer)
+        for producer in (relay.producer, second.producer):
+            self.assertRegex(producer, r"\A[0-9a-f]{32}\Z")
+
+    def test_answers_outside_the_contract_stop_it(self) -> None:
+        tampers = {"garbage": "garbage",
+                   "not an object": lambda answer: [answer],
+                   "extra field": lambda answer: {**answer, "role": "guest"},
+                   "missing added": lambda answer: {k: v for k, v in answer.items() if k != "added"},
+                   "other session": lambda answer: {**answer, "session": "sessions/other"},
+                   "other epoch": lambda answer: {**answer, "epoch": "z" * 20},
+                   "part of the batch": lambda answer: {**answer, "added": 1},
+                   "more than the batch": lambda answer: {**answer, "added": 3},
+                   "boolean added": lambda answer: {**answer, "added": True},
+                   "first past last": lambda answer: {**answer, "first": answer["last"] + 2},
+                   "additions not kept": lambda answer: {**answer, "first": answer["last"]},
+                   "journal went back": lambda answer: {**answer, "last": answer["last"] - answer["added"]}}
+        for name, tamper in tampers.items():
+            with self.subTest(name):
+                self.setUp()
+                game = FakeGame(host=False)
+                relay = self.proposer(game, proposal_batch=2)
+                relay.start()
+                game.change(1, 1, 2)
+                game.change(2, 1, 2)
+                relay.step()
+                self.assertEqual(relay.proposed, 2)
+                game.change(1, 2, 3)
+                game.change(2, 2, 3)
+                self.contract.faults.append(("POST", tamper))
+                with self.assertRaises(cb.ProtocolError):
+                    relay.step()
+                self.assert_stopped(game)
+                self.assertEqual(relay.proposed, 2)
+
+    def test_refusals_stop_it(self) -> None:
+        def limit(contract: Contract) -> None:  # every producer slot taken by others
+            contract.producers.update((f"{n:032x}", 1) for n in range(contract.PRODUCERS))
+
+        for name, damage, acknowledged, error_type, code in (
+                ("new epoch", lambda c: setattr(c, "epoch", "z" * 20), 1, cb.LiveConflict, "stale_epoch"),
+                ("host left", lambda c: setattr(c, "host_present", False), 1, cb.LiveConflict, "host_absent"),
+                ("producer forgotten", lambda c: c.producers.clear(), 1, cb.LiveConflict, "sequence_gap"),
+                ("producer limit", limit, 0, cb.LiveRefused, "too_many_producers"),
+                ("creator's account", lambda c: setattr(c, "role", "host"), 0, cb.LiveRefused, "not_guest")):
+            with self.subTest(name):
+                self.setUp()
+                game = FakeGame(host=False)
+                relay = self.proposer(game)
+                relay.start()
+                if acknowledged:
+                    game.change(1, 1, 2)
+                    relay.step()
+                damage(self.contract)
+                game.change(2, 1, 2)
+                with self.assertRaises(error_type) as caught:
+                    relay.step()
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(relay.proposed, acknowledged)
+                self.assert_stopped(game)
+
+    def test_a_resend_the_server_no_longer_keeps_stops_it(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.proposer(game)
+        relay.start()
+        self.contract.faults = [("POST", "drop_after")] * 2
+        game.change(1, 1, 2)
+        relay.step()
+        self.assertEqual((self.held(), relay.proposed), ([story(1, 1, 2)], 0))
+        self.contract.proposal_base, self.contract.proposals = 1, []  # discarded after it arrived
+        with self.assertRaises(cb.LiveConflict) as caught:
+            relay.step()
+        self.assertEqual(caught.exception.code, "sequence_expired")
+        self.assertEqual(relay.proposed, 0)
+        self.assert_stopped(game)
+
+    def test_overflow_loss_and_changes_the_contract_cannot_carry_stop_it_unsent(self) -> None:
+        cases = (("story journal overflow", lambda g: [g.change(qid, 1, 2) for qid in range(1, 130)], cb.MailboxError),
+                 ("unique journal loss", lambda g: [g.unique_change(11, n % 2, 1 - n % 2, "counter", 4)
+                                                    for n in range(cb.UNIQUE_JOURNAL_SLOTS + 1)], cb.MailboxError),
+                 ("unknown story origin", lambda g: (g.set_u32(cb.MB_JOURNAL, 3 | 1 << 16 | 2 << 20 | 2 << 24),
+                                                     g.set_u32(cb.MB_OUT_W, 1)), cb.MailboxError),
+                 ("story state 0", lambda g: g.change(3, 0, 2), cb.ResyncRequired),
+                 ("state at a counter site", lambda g: g.unique_change(11, 1, 2, "state", 4), cb.ResyncRequired),
+                 ("state its site does not write", lambda g: g.unique_change(11, 1, 3, "state", 0), cb.ResyncRequired))
+        for name, damage, error_type in cases:
+            with self.subTest(name):
+                self.setUp()
+                game = FakeGame(host=False)
+                relay = self.proposer(game)
+                relay.start()
+                damage(game)
+                with self.assertRaises(error_type):
+                    relay.step()
+                self.assert_stopped(game)
+                self.assertEqual(self.contract.proposal_posts, [])
+
+    def test_buffering_is_bounded_while_the_server_is_unreachable(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.proposer(game, proposal_batch=2, max_proposals=4)
+        relay.start()
+        self.contract.faults = [("*", "unavailable")] * 10
+        for qid in range(1, 4):
+            game.change(qid, 1, 2)
+        relay.step()
+        relay.step()
+        self.assertEqual((relay.proposed, relay.proposals_pending), (0, 3))
+        game.change(4, 1, 2)
+        game.change(5, 1, 2)
+        with self.assertRaisesRegex(cb.BridgeError, "refusing to buffer"):
+            relay.step()
+        self.assert_stopped(game)
+        self.assertEqual(self.contract.proposals, [])
+
+    def test_an_outage_keeps_every_proposal_until_the_offline_timeout(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.proposer(game, offline_timeout=30)
+        relay.start()
+        self.contract.faults = [("*", "drop_before")] * 20
+        game.change(1, 1, 2)
+        relay.step()
+        self.clock.now = 29
+        relay.step()
+        self.assertEqual((relay.proposed, relay.proposals_pending), (0, 1))
+        self.contract.faults.clear()
+        relay.step()
+        self.assertEqual((self.held(), relay.proposed), ([story(1, 1, 2)], 1))
+        self.contract.faults = [("*", "drop_before")] * 20
+        game.change(1, 2, 3)
+        relay.step()
+        self.clock.now = 60
+        with self.assertRaisesRegex(cb.BridgeError, "unreachable"):
+            relay.step()
+        self.assert_stopped(game)
+        self.assertEqual(self.held(), [story(1, 1, 2)])
+
+    def test_needs_the_guest_role_and_an_explicit_opt_in(self) -> None:
+        self.contract.role = "host"
+        game = FakeGame(host=False)
+        with self.assertRaises(cb.LiveRefused) as caught:
+            self.proposer(game).start()
+        self.assertEqual(caught.exception.code, "not_guest")
+        self.assertEqual(game.writes, [])
+        for options in ({"propose": 1}, {"propose": True, "proposal_batch": 0},
+                        {"propose": True, "proposal_batch": cb.MAX_EVENTS_PER_POST + 1},
+                        {"propose": True, "proposal_batch": 20, "max_proposals": 10},
+                        {"propose": True, "proposal_batch": 1.5},
+                        {"propose": True, "max_proposals": True}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.guest_relay(FakeGame(host=False), **options)
+
+
 class EndToEndTest(LiveFixture):
     def test_host_changes_reach_the_guest_game_once_and_in_order(self) -> None:
         host_game, guest_game = FakeGame(host=True), FakeGame(host=False)
@@ -906,6 +1350,83 @@ class EndToEndTest(LiveFixture):
         guest.step()
         host.step()
         self.assertEqual(self.contract.events, changes)
+
+
+class ServerContractTest(LiveFixture):
+    """A proposing guest relay against server.py's own CampaignLive: /campaign/live and
+    /campaign/live/proposals as the server parses, stores and answers them."""
+
+    def setUp(self) -> None:
+        try:
+            import server
+        except ImportError as exc:
+            self.skipTest(f"server.py's dependencies are missing: {exc}")
+        super().setUp()
+        self.srv = server
+        self.contract = ServerContract(server)
+        self.server.contract = self.contract
+
+    def test_a_proposing_guest_relay_posts_what_the_server_takes(self) -> None:
+        game = FakeGame(host=False)
+        relay = self.guest_relay(game, propose=True, proposal_batch=2)
+        view = relay.start()
+        self.assertEqual(view.role, "guest")
+        body = json.dumps({"session": SESSION, "epoch": view.epoch, "first": 1,
+                           "events": [{"id": 1, "old": 1, "new": 2}]}).encode()
+        status, answer = self.contract.call(self.contract.host, "POST", cb.LIVE_PATH, body, "application/json")
+        self.assertEqual(status, 200, answer)
+        game.unique_effects[1, 2] = [(11, 1, 2, "state", 0)]
+        pump(relay, game, lambda: relay.consumed == 1)
+        game.change(5, 1, 2)
+        game.unique_change(11, 2, 3, "state", 2)
+        game.unique_change(12, 0, 9, "counter", 13)
+        self.contract.faults.append(("POST", "drop_after"))  # the first batch arrives, its answer is lost
+        for _ in range(3):
+            relay.step()
+        query = urlencode({"session": SESSION, "epoch": view.epoch, "after": 0})
+        status, state = self.contract.call(self.contract.host, "GET", f"{cb.PROPOSALS_PATH}?{query}")
+        self.assertEqual(status, 200, state)
+        events = [story(5, 1, 2), unique(11, 2, 3, "state", 2), unique(12, 0, 9, "counter", 13)]
+        self.assertEqual(state["proposals"], [{"seq": number, "producer": relay.producer, "number": number,
+                                               "event": event} for number, event in enumerate(events, 1)])
+        self.assertEqual((relay.replayed, relay.unique_replayed, relay.proposed, relay.proposals_pending),
+                         (1, 1, 3, 0))
+        self.assertEqual([target for method, target, _ in self.contract.requests if method == "POST"],
+                         [cb.PROPOSALS_PATH] * 3)
+
+    def test_client_accepts_overlap_with_new_suffix_from_real_server(self) -> None:
+        view = self.client.discover()
+        producer = "e" * 32
+        first = cb.Proposal("story", 10, 1, 2)
+        second = cb.Proposal("unique", 11, 2, 3, "state", 2)
+        third = cb.Proposal("unique", 11, 0, 3, "counter", 9)
+        self.assertEqual(self.client.propose(SESSION, view.epoch, producer, 1, [first, second]).added, 2)
+        receipt = self.client.propose(SESSION, view.epoch, producer, 2, [second, third])
+        self.assertEqual((receipt.first, receipt.last, receipt.added), (1, 3, 1))
+        query = urlencode({"session": SESSION, "epoch": view.epoch, "after": 0})
+        status, state = self.contract.call(self.contract.host, "GET", f"{cb.PROPOSALS_PATH}?{query}")
+        self.assertEqual((status, [p["event"] for p in state["proposals"]]),
+                         (200, [first.payload(), second.payload(), third.payload()]))
+
+    def test_the_servers_refusals_stop_it(self) -> None:
+        returned = types.SimpleNamespace(name="userSessions/host-again")
+        for name, damage, code in (("host left", lambda c: c.users.pop("users/host"), "host_absent"),
+                                   ("host returned", lambda c: c.users.__setitem__("users/host", returned),
+                                    "stale_epoch")):
+            with self.subTest(name):
+                self.setUp()
+                game = FakeGame(host=False)
+                relay = self.guest_relay(game, propose=True)
+                relay.start()
+                game.change(1, 1, 2)
+                relay.step()
+                self.assertEqual(relay.proposed, 1)
+                damage(self.contract)
+                game.change(1, 2, 3)
+                with self.assertRaises(cb.LiveConflict) as caught:
+                    relay.step()
+                self.assertEqual(caught.exception.code, code)
+                self.assert_stopped(game)
 
 
 @unittest.skipUnless(os.name == "nt", "attaching to a process needs Windows")

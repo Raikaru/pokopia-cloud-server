@@ -6,25 +6,32 @@ The patch (made by _scratch/quest_sync_trace/quest_sync_patch.py) gives the game
 quest writers (cave D). This module moves those changes between players over /campaign/live on the game
 backend, an HTTP/1.1 endpoint behind client certificates:
 
-- HostRelay runs on the PC of the session creator's account. It sends every quest change the host game
-  makes itself (journal origin 0), in game order. Each change gets a sequence number, so a resend after a
-  lost answer does no harm.
-- GuestRelay runs on every other player's PC. It polls the events and queues them, in order, into the
-  guest game's inbox. Nothing a guest game does is ever sent, its own replays (origin 1) included.
+- HostRelay runs on the PC of the session creator's account. It sends story changes marked as local
+  (journal origin 0), with sequence numbers so a resend after a lost answer does no harm.
+- GuestRelay runs on every other player's PC. It polls the events and queues them into the guest
+  game's inbox. By default nothing a guest game does is sent. Only with propose=True, which the
+  launcher does not set, does it post changes marked as local to /campaign/live/proposals for the
+  host to judge. This is not a complete or reliable account of local changes: the story journal
+  uses a global applying flag and non-atomic writer, so concurrent writes can be misclassified or
+  lost; deferred replay effects can also appear local (see GuestRelay).
 
-Deliberately not solved here: unique-quest changes, a guest's initial quest state and durable stage checkpoints. A guest starts
+Deliberately not solved here: applying unique-quest changes or guest proposals anywhere (no code here reads
+/campaign/live/proposals), a guest's initial quest state and durable stage checkpoints. A guest starts
 at cursor 0 and replays what the server still holds. Quest changes the host made before its relay attached
 were never journaled. The relay stops with ResyncRequired, and nothing performs that resync, when:
 - an event lowers a quest state, including a reset to 1 (the patch can only raise states to 2..4);
 - the server has discarded history the relay still needs;
 - the epoch or the session changes.
 If a guest's quest is already at or past an event's target, the patch skips the event without a word, so
-diverged saves go unnoticed as well. This transport alone does not make story co-op work.
+diverged saves go unnoticed as well. This transport alone does not make story co-op work. In one real
+two-client test, a guest accepted quest 11 only with an additional test-only NOP at main+0x114384
+(visitor eligibility); this patch neither applies nor checks that NOP.
 
 Who relays what is decided by the authenticated server role, never by the game's session bytes, which
 read zero on a live online host. HostRelay requires the role "host" (this account created the session) and
-the game showing the patched host capability mask. GuestRelay never writes, so it runs under any member's
-role, another device of the creator's account included, but its game must show the patched guest mask.
+the game showing the patched host capability mask. A GuestRelay that only replays never writes, so it runs
+under any member's role, another device of the creator's account included; a proposing one needs the role
+"guest". Either way its game must show the patched guest mask.
 
 Anything else unexpected also stops a relay (BridgeError) and turns the game's mailbox off: the process
 exits; a patch byte differs; the mailbox was not pristine or loses its contents; the journal overflows; the
@@ -46,6 +53,7 @@ import itertools
 import json
 import logging
 import re
+import secrets
 import ssl
 import struct
 import sys
@@ -164,6 +172,15 @@ MAX_EVENTS_PER_POST = 64
 MAX_POST_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 1 << 20
 EPOCH = re.compile(r"[A-Za-z0-9._~-]{1,128}")
+# Guest proposals (/campaign/live/proposals): a producer is a random 128-bit id that numbers its own proposals
+# 1, 2, ...; posts and their limits are those of the host events. A unique-quest change names the patch's
+# natural writer site 0..13 (14 is unused, 15 marks a uniqueCas replay); sites 0..3 write these states.
+PROPOSALS_PATH = "/campaign/live/proposals"
+PRODUCER = re.compile(r"[0-9a-f]{32}")
+UNIQUE_QUEST_IDS = range(1, 201)
+UNIQUE_BYTES = range(256)
+UNIQUE_SITES = range(14)
+UNIQUE_SITE_STATES = (2, 4, 3, 5)
 
 
 class BridgeError(Exception):
@@ -310,6 +327,68 @@ class UniqueJournalEntry:
                 or (field == "state" and (old > 5 or new not in range(1, 6)))):
             raise MailboxError(f"invalid or gap-marked unique quest journal entry {word:#010x}")
         return cls(sequence, quest_id, field, old, new, origin, site)
+
+
+@dataclass(frozen=True)
+class Proposal:
+    """A guest game's own quest change as /campaign/live/proposals carries it, for the host to judge: a story
+    change (kind "story", within the QuestEvent limits) or a unique-quest byte change (kind "unique": quest
+    1..200, two different bytes 0..255 and the natural writer site 0..13; sites 0..3 set the unique state
+    2, 4, 3 and 5 from at most 5, the others write the counter)."""
+
+    kind: str
+    id: int
+    old: int
+    new: int
+    field: str | None = None  # unique only: state or counter
+    site: int | None = None  # unique only
+
+    def __post_init__(self) -> None:
+        if self.kind == "story":
+            if self.field is not None or self.site is not None:
+                raise ValueError(f"a story proposal has no field or site: {self!r}")
+            QuestEvent(self.id, self.old, self.new)
+            return
+        if self.kind != "unique":
+            raise ValueError(f"a proposal is a story or a unique quest change, not {self.kind!r}")
+        if not all(type(value) is int for value in (self.id, self.old, self.new, self.site)):
+            raise ValueError(f"unique proposal fields must be integers: {self!r}")
+        if self.id not in UNIQUE_QUEST_IDS:
+            raise ValueError(f"unique quest id {self.id} is outside 1..200")
+        if self.old not in UNIQUE_BYTES or self.new not in UNIQUE_BYTES or self.old == self.new:
+            raise ValueError(f"unique quest {self.id}: {self.old} -> {self.new} is not a change between bytes 0..255")
+        if self.site not in UNIQUE_SITES:
+            raise ValueError(f"unique quest {self.id}: writer site {self.site} is not a natural one (0..13)")
+        if self.site < len(UNIQUE_SITE_STATES):
+            if self.field != "state" or self.old > 5 or self.new != UNIQUE_SITE_STATES[self.site]:
+                raise ValueError(f"unique quest {self.id}: {self.field} {self.old} -> {self.new} is not what writer "
+                                 f"site {self.site} writes (the state, {UNIQUE_SITE_STATES[self.site]})")
+        elif self.field != "counter":
+            raise ValueError(f"unique quest {self.id}: writer site {self.site} writes the counter, not {self.field!r}")
+
+    @classmethod
+    def of(cls, entry: JournalEntry | UniqueJournalEntry) -> Proposal:
+        """The proposal of a journal entry; ValueError if the contract cannot carry it."""
+        if isinstance(entry, UniqueJournalEntry):
+            return cls("unique", entry.id, entry.old, entry.new, entry.field, entry.site)
+        return cls("story", entry.id, entry.old, entry.new)
+
+    def payload(self) -> dict[str, object]:
+        result: dict[str, object] = {"kind": self.kind, "id": self.id, "old": self.old, "new": self.new}
+        if self.kind == "unique":
+            result.update(field=self.field, site=self.site)
+        return result
+
+
+@dataclass(frozen=True)
+class ProposalReceipt:
+    """The answer to a /campaign/live/proposals POST. The 200 acknowledges the complete batch; `added`
+    counts only its previously unseen suffix. first..last bound the session's proposal journal, which
+    every guest shares, so they say nothing about any one producer's numbers."""
+
+    first: int
+    last: int
+    added: int
 
 
 @dataclass(frozen=True)
@@ -734,6 +813,24 @@ def parse_view(obj: dict, after: int | None) -> LiveView:
     return LiveView(session, epoch, role, first, last, tuple(events))
 
 
+def parse_receipt(obj: dict, session: str, epoch: str, count: int) -> ProposalReceipt:
+    """Validates the answer to a /campaign/live/proposals POST of `count` proposals."""
+    if obj.keys() != {"session", "epoch", "first", "last", "added"}:
+        raise ProtocolError(f"the server's proposal answer holds {sorted(obj)}, not session, epoch, first, last "
+                            f"and added")
+    if (obj["session"], obj["epoch"]) != (session, epoch):
+        raise ProtocolError(f"proposed to {session} epoch {epoch}, the server answered for {obj['session']!r} epoch "
+                            f"{obj['epoch']!r}")
+    first, last, added = _seq(obj, "first", 1), _seq(obj, "last", 0), obj["added"]
+    if first > last + 1:
+        raise ProtocolError(f"the server's proposal journal starts at {first} after its end {last}")
+    if type(added) is not int or not 0 <= added <= count:
+        raise ProtocolError(f"the server added {added!r} of {count} proposals")
+    if added > last - first + 1:
+        raise ProtocolError(f"the server added {added} proposals but its journal holds only {first}..{last}")
+    return ProposalReceipt(first, last, added)
+
+
 class LiveClient:
     """HTTP/1.1 client of /campaign/live over the mutually authenticated connection to the game backend.
 
@@ -845,6 +942,26 @@ class LiveClient:
                                 f"role {view.role}, journal end {view.last}")
         return view.last
 
+    def propose(self, session: str, epoch: str, producer: str, first: int,
+                proposals: Sequence[Proposal]) -> ProposalReceipt:
+        """Posts proposals as the numbers first.. of producer (guests only, while the session creator is in
+        the session). Resending the same proposals at the same numbers succeeds, with added 0 if they had
+        arrived; other proposals at a taken number, a gap or a number the server no longer keeps raise
+        LiveConflict. The receipt's first and last are the shared journal's, not this producer's."""
+        if (not _valid_session(session) or not _valid_epoch(epoch) or not isinstance(producer, str)
+                or PRODUCER.fullmatch(producer) is None or type(first) is not int or not 1 <= first <= MAX_SEQ):
+            raise ValueError(f"bad proposal post {session!r} {epoch!r} {producer!r} {first!r}")
+        if not 1 <= len(proposals) <= MAX_EVENTS_PER_POST or first + len(proposals) - 1 > MAX_SEQ:
+            raise ValueError(f"a proposal post carries 1..{MAX_EVENTS_PER_POST} proposals, not {len(proposals)}")
+        if not all(isinstance(proposal, Proposal) for proposal in proposals):
+            raise ValueError("a proposal post carries Proposal objects only")
+        body = json.dumps({"session": session, "epoch": epoch, "producer": producer, "first": first,
+                           "events": [proposal.payload() for proposal in proposals]},
+                          separators=(",", ":")).encode()
+        if len(body) > MAX_POST_BYTES:
+            raise ValueError(f"the proposal post body is larger than {MAX_POST_BYTES} bytes")
+        return parse_receipt(self._request("POST", PROPOSALS_PATH, body), session, epoch, len(proposals))
+
 
 # --- Relays -------------------------------------------------------------------------------------------------
 
@@ -852,11 +969,11 @@ class _Relay:
     _host_side: bool
 
     def __init__(self, client: LiveClient, game: Game, *, drain: bool, skip_mask: int, offline_timeout: float,
-                 retry_delay: float, clock: Callable[[], float]) -> None:
+                 retry_delay: float, clock: Callable[[], float], unique_journal: bool = False) -> None:
         if not offline_timeout > 0 or not retry_delay >= 0:
             raise ValueError("offline_timeout must be positive and retry_delay non-negative")
         self.client, self.game = client, game
-        self.mailbox = Mailbox(game, drain=drain, journal=True, skip_mask=skip_mask)
+        self.mailbox = Mailbox(game, drain=drain, journal=True, unique_journal=unique_journal, skip_mask=skip_mask)
         self.session: str | None = None
         self.epoch: str | None = None
         self.server_role: str | None = None
@@ -1032,20 +1149,49 @@ class GuestRelay(_Relay):
     the live session is a different one. `consumed` is the last seq the game's drain has taken from the inbox;
     persist (session, epoch, consumed) to resume. `received` is the last seq fetched. The guest's journal is
     only observed: `replayed` counts the changes its drain made (origin 1), `local_changes` the changes the
-    guest game made on its own (origin 0). None of them is ever sent."""
+    guest game made on its own (origin 0). Unless propose is set, none of them is ever sent.
+
+    propose=True, an explicit opt-in that the launcher does not use, needs the server role "guest". It also
+    arms the game's unique-quest journal and posts the guest game's own changes to /campaign/live/proposals:
+    story changes of journal origin 0 and unique-quest changes of unique origin 0. Replayed story changes
+    (origin 1), uniqueCas replays (unique origin 1) and side effects on the drain thread (unique origin 2)
+    are only counted, in `replayed` and `unique_replayed`. Proposals are untrusted input for the host to
+    judge against its own game, which may have made the same change on its own (the host's inventory alone
+    can advance quest 11); nothing here applies them, on the host or anywhere else. They go out in
+    batches of up to proposal_batch, as the numbers 1, 2, ... of `producer`, a random 128-bit id of this
+    relay alone; `proposed` is how many the server has acknowledged. A batch whose answer was lost is resent
+    unchanged, at the same numbers, until offline_timeout. The shared journal bounds in the server's answers
+    are only checked never to go back, never taken as an acknowledgement. The relay stops, giving up the
+    proposals the server has not acknowledged (close() logs how many), when more than max_proposals wait,
+    the guest game makes a change the contract cannot carry, a journal loses an entry, the server refuses a
+    batch (a conflict, a gap, a number it no longer keeps, a new epoch, a host that left) or answers outside
+    the contract. A new relay is a new producer, and the server takes at most 64 producers per epoch.
+
+    The numbers order each journal on its own: story changes in observed order, unique changes in reservation
+    order. The rings are separate, so between a story and a unique proposal the numbers only say which
+    ring a step read first (story), not which change came first. The story journal's global applying flag
+    can mark a concurrent local change as a replay, and concurrent writers can lose story entries without
+    detecting overflow. Conversely, a deferred replay effect can appear local. This sender is not a reliable
+    basis for campaign synchronization."""
 
     _host_side = False
 
     def __init__(self, client: LiveClient, game: Game, *, session: str | None = None, epoch: str | None = None,
                  after: int = 0, poll_interval: float = 0.5, skip_mask: int = DEFAULT_SKIP_MASK,
+                 propose: bool = False, proposal_batch: int = MAX_EVENTS_PER_POST, max_proposals: int = 1024,
                  offline_timeout: float = 60.0, retry_delay: float = 1.0,
                  clock: Callable[[], float] = time.monotonic) -> None:
+        if type(propose) is not bool:
+            raise ValueError(f"propose is True or False, not {propose!r}")
         super().__init__(client, game, drain=True, skip_mask=skip_mask, offline_timeout=offline_timeout,
-                         retry_delay=retry_delay, clock=clock)
+                         retry_delay=retry_delay, clock=clock, unique_journal=propose)
         if type(after) is not int or not 0 <= after <= MAX_SEQ or not poll_interval >= 0:
             raise ValueError("bad cursor or poll interval")
         if (session is None) != (epoch is None) or (after and session is None):
             raise ValueError("a cursor belongs to one session and epoch: pass both with it")
+        if (type(proposal_batch) is not int or type(max_proposals) is not int
+                or not 1 <= proposal_batch <= MAX_EVENTS_PER_POST or max_proposals < proposal_batch):
+            raise ValueError("bad proposal batch or max_proposals")
         self._resume = (session, epoch) if session is not None else None
         self._poll_interval = poll_interval
         self.received = self.consumed = after
@@ -1053,6 +1199,16 @@ class GuestRelay(_Relay):
         self._queue: collections.deque[tuple[int, int]] = collections.deque()  # (seq, inbox word) not yet queued
         self._inbox: collections.deque[int] = collections.deque()  # seqs in the inbox, not yet taken
         self._next_poll = 0.0
+        self._propose, self._proposal_batch, self._max_proposals = propose, proposal_batch, max_proposals
+        self.producer = secrets.token_hex(16) if propose else None
+        self.proposed = self.unique_replayed = 0
+        self._proposals: collections.deque[Proposal] = collections.deque()  # read, not yet posted
+        self._posting: tuple[Proposal, ...] = ()  # posted as numbers proposed + 1.., not yet acknowledged
+        self._proposal_bounds = (1, 0)  # the shared proposal journal's first and last in the newest answer
+
+    @property
+    def proposals_pending(self) -> int:
+        return len(self._proposals) + len(self._posting)
 
     def start(self) -> LiveView:
         """Finds the live session (the one to resume, if given). Then arms the drain of a game showing the
@@ -1061,23 +1217,59 @@ class GuestRelay(_Relay):
         if self._resume is not None and (view.session, view.epoch) != self._resume:
             raise SessionChanged(f"the cursor belongs to {self._resume[0]} epoch {self._resume[1]}, the live session "
                                  f"is {view.session} epoch {view.epoch}")
+        if self._propose and view.role != "guest":
+            raise LiveRefused(None, "not_guest", "this account created the live session; only other accounts' PCs "
+                                                 "propose guest quest changes")
         self._attach(view)
         log.info("guest relay attached to %s epoch %s after seq %d", view.session, view.epoch, self.received)
+        if self._propose:
+            log.info("guest relay proposes this game's own quest changes as producer %s", self.producer)
         return view
+
+    def close(self) -> None:
+        if self.mailbox.attached and self.proposals_pending:
+            log.warning("guest relay stopped with %d quest proposals the server has not acknowledged",
+                        self.proposals_pending)
+        super().close()
 
     def _step(self) -> None:
         for _ in range(self._check_game()):
             self.consumed = self._inbox.popleft()
         for entry in self.mailbox.read_journal():
+            if self._propose and entry.origin > 1:
+                raise MailboxError(f"the guest journal holds a change of unknown origin: {entry}")
             if entry.origin:
                 self.replayed += 1
                 log.debug("guest replayed quest %d: %d -> %d", entry.id, entry.old, entry.new)
             else:
                 self.local_changes += 1
-                log.info("guest game changed quest %d itself: %d -> %d (not sent)", entry.id, entry.old, entry.new)
+                if self._propose:
+                    self._take(entry)
+                else:
+                    log.info("guest game changed quest %d itself: %d -> %d (not sent)", entry.id, entry.old,
+                             entry.new)
+        if self._propose:
+            for unique in self.mailbox.read_unique_journal():
+                if unique.origin:
+                    self.unique_replayed += 1
+                    log.debug("guest unique quest %d %s %d -> %d by %s (not sent)", unique.id, unique.field,
+                              unique.old, unique.new, "a uniqueCas replay" if unique.origin == 1 else "the drain")
+                else:
+                    self._take(unique)
+            if self.proposals_pending > self._max_proposals:
+                raise BridgeError(f"{self.proposals_pending} guest quest proposals are waiting for the server; "
+                                  f"refusing to buffer more")
         self._fill()
         now = self._clock()
-        if self._queue or now < self._retry_at or now < self._next_poll:
+        if now < self._retry_at:
+            return
+        if self.proposals_pending:
+            try:
+                self._send_proposals(now)
+            except LiveUnavailable as exc:
+                self._unavailable(exc)
+                return
+        if self._queue or now < self._next_poll:
             return
         try:
             view = self.client.poll(self.session, self.epoch, self.received)
@@ -1098,3 +1290,31 @@ class GuestRelay(_Relay):
             taken = self.mailbox.push([word for _, word in itertools.islice(self._queue, INBOX_SLOTS)])
             for _ in range(taken):
                 self._inbox.append(self._queue.popleft()[0])
+
+    def _take(self, entry: JournalEntry | UniqueJournalEntry) -> None:
+        try:
+            proposal = Proposal.of(entry)
+        except ValueError as exc:
+            raise ResyncRequired(f"the guest game made a quest change the proposal contract cannot carry: "
+                                 f"{entry}") from exc
+        self._proposals.append(proposal)
+        log.info("guest game changed %s itself (proposed)", proposal.payload())
+
+    def _send_proposals(self, now: float) -> None:
+        if not self._posting:
+            self._posting = tuple(self._proposals.popleft()
+                                  for _ in range(min(self._proposal_batch, len(self._proposals))))
+        first = self.proposed + 1
+        receipt = self.client.propose(self.session, self.epoch, self.producer, first, self._posting)
+        if receipt.added not in (0, len(self._posting)):
+            raise ProtocolError(f"the server added {receipt.added} of this relay's {len(self._posting)} "
+                                "proposals; its batch must be new or an exact retry")
+        low, high = self._proposal_bounds
+        if receipt.first < low or receipt.last < high + receipt.added:
+            raise ProtocolError(f"the server's proposal journal went from {low}..{high} to "
+                                f"{receipt.first}..{receipt.last} while adding {receipt.added} proposals")
+        for number, proposal in enumerate(self._posting, first):
+            log.info("guest proposal %d of producer %s acknowledged: %s", number, self.producer, proposal.payload())
+        self.proposed += len(self._posting)
+        self._posting, self._proposal_bounds = (), (receipt.first, receipt.last)
+        self._last_contact = now
