@@ -40,7 +40,7 @@ This has been tested with two emulator instances on one Windows PC, connecting t
 
 - Python 3.10 or newer. The code uses `contextlib.aclosing`, which was added in 3.10.
 - The OpenSSL command-line tool, used to generate certificates.
-- A compatible [Eglantine Online](https://github.com/Raikaru/Eglantine) build with private-server support; the launcher checks for the required settings. The server alone does not provide the emulator, game files, firmware or keys.
+- A compatible [Eglantine Online](https://github.com/Raikaru/Eglantine-Online) build with private-server support; the launcher checks for the required settings. The server alone does not provide the emulator, game files, firmware or keys.
 - For client-certificate mode: `requirements-portal.txt` on the server, and on every player's PC either `PokopiaLauncher.exe` (no Python needed) or Python with `requirements-launcher.txt`.
 
 ## Setup

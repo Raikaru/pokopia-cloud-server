@@ -7,7 +7,7 @@ A self-hosted replacement for the NPLN services used by Pokémon Pokopia's Cloud
 ## Requirements
 
 - Python 3.10 or newer and OpenSSL.
-- A compatible [Eglantine Online](https://github.com/Raikaru/Eglantine) build with private-server support.
+- A compatible [Eglantine Online](https://github.com/Raikaru/Eglantine-Online) build with private-server support.
 - Your own game, decryption keys and any required firmware.
 - For public hosting: a domain, HTTPS, and the account portal and launcher dependencies.
 
