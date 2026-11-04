@@ -28,3 +28,11 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Launcher packaging (README, "Packaging the launcher"): PyInstaller output and the operator's portal
+# address.
+build/
+dist/
+*.spec
+portal.txt
+relay.txt
