@@ -245,7 +245,7 @@ class SnapshotTest(unittest.TestCase):
         self.service = server.SnapshotService(self.store, registry)
         async with self.serving():
             reader, writer = await asyncio.open_unix_connection(self.socket)
-            self.assertEqual(await reader.readline(), b"pokopia-snapshot 1 ok\n")
+            self.assertEqual(await reader.readline(), b"pokopia-snapshot 2 ok\n")
             registry.commit(info.campaign, OWNER, second.etag, **common(2))
             data = await reader.read()
             writer.close()
@@ -270,6 +270,7 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(returncode, 0, errors)
         self.assertEqual(self.check(output).returncode, 0)
         streamed = self.archive_files(output)
+        self.assertEqual(json.loads(streamed["snapshot.json"])["server_snapshot_protocol"], 2)
         with registry.capture_backup() as backup:
             latest = {f"data/campaigns/{path}": data for path, data in contents(backup).items()}
         self.assertEqual({name: value for name, value in streamed.items() if name.startswith("data/campaigns/")},
@@ -537,6 +538,13 @@ class CampaignCheckTest(unittest.TestCase):
         self.assertNotEqual(checked.returncode, 0)
         self.assertIn("lack the server's captured inventory", checked.stderr)
 
+    def test_protocol_two_without_inventory_is_refused_even_if_no_campaign_files_arrive(self) -> None:
+        manifest = {"format": 1, "damaged_blobs": [], "server_snapshot_protocol": 2}
+        archive = tar({"data/state.json": b"{}"}, manifest, "w:gz")
+        checked = check_archive(archive, self.root)
+        self.assertNotEqual(checked.returncode, 0)
+        self.assertIn("lack the server's captured inventory", checked.stderr)
+
     def test_only_campaign_files_need_campaign_store(self) -> None:
         standalone = self.root / "standalone"
         standalone.mkdir()
@@ -558,12 +566,13 @@ class CampaignSnapshotTest(unittest.TestCase):
         self.root = Path(directory.name)
         self.files, self.campaign, _ = campaign_files(self.root / "campaigns")
 
-    async def run_client(self, files: dict[str, bytes], inventory: dict | None = None) -> tuple[int, bytes, bytes]:
+    async def run_client(self, files: dict[str, bytes], inventory: dict | None = None,
+                         protocol: int = 1) -> tuple[int, bytes, bytes]:
         """snapshot.py --socket from a server that sends `files` and a manifest that matches them."""
         manifest = {"format": 1, "created": 0, "damaged_blobs": []}
         if inventory is not None:
             manifest["campaign_inventory"] = inventory
-        stream = b"pokopia-snapshot 1 ok\n" + tar(files, manifest, "w")
+        stream = f"pokopia-snapshot {protocol} ok\n".encode() + tar(files, manifest, "w")
 
         async def send(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             with contextlib.suppress(OSError):  # a client that fails stops reading
@@ -596,6 +605,12 @@ class CampaignSnapshotTest(unittest.TestCase):
                           if name.startswith("data/campaigns/")})
         checked = check_archive(output, self.root)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+
+    def test_protocol_two_requires_inventory_even_without_campaign_files(self) -> None:
+        returncode, output, errors = asyncio.run(self.run_client({"data/state.json": b"{}"}, protocol=2))
+        self.assertNotEqual(returncode, 0)
+        self.assertIn(b"lack the server's captured inventory", errors)
+        self.assertNotEqual(check_archive(output, self.root).returncode, 0)
 
     def test_snapshot_refuses_missing_captured_metadata(self) -> None:
         inventory = {name: manifest_entry(data) for name, data in self.files.items()
