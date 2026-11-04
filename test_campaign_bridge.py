@@ -1605,6 +1605,35 @@ class ServerContractTest(LiveFixture):
                          (1, 1, 3, 0))
         self.assertEqual([target for method, target, _ in self.contract.requests if method == "POST"],
                          [cb.PROPOSALS_PATH] * 3)
+        with self.assertRaises(cb.LiveRefused) as denied:
+            self.client.poll_proposals(SESSION, view.epoch, 0)
+        self.assertEqual((denied.exception.status, denied.exception.code), (403, "not_host"))
+        self.contract.guest = self.contract.host  # the host's authenticated connection
+        page = self.client.poll_proposals(SESSION, view.epoch, 0)
+        self.assertEqual((page.first, page.last), (1, 3))
+        self.assertEqual([(p.seq, p.producer, p.number, p.change.payload()) for p in page.proposals],
+                         [(i, relay.producer, i, event) for i, event in enumerate(events, 1)])
+        self.assertEqual([p.seq for p in self.client.poll_proposals(SESSION, view.epoch, 2).proposals], [3])
+
+    def test_host_rejects_malformed_proposal_pages(self) -> None:
+        view = self.client.discover()
+        producer = "f" * 32
+        self.client.propose(SESSION, view.epoch, producer, 1, [cb.Proposal("story", 10, 1, 2)])
+        self.contract.guest = self.contract.host
+        mutations = (
+            lambda answer: {**answer, "session": "sessions/other"},
+            lambda answer: {**answer, "proposals": []},
+            lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "seq": 2}]},
+            lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "number": True}]},
+            lambda answer: {**answer, "proposals": [{**answer["proposals"][0], "producer": "BAD"}]},
+            lambda answer: {**answer, "proposals": [{**answer["proposals"][0],
+                                                      "event": {"kind": "story", "id": 10, "old": 1, "new": 1}}]},
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                self.contract.faults.append(("GET", mutate))
+                with self.assertRaises(cb.ProtocolError):
+                    self.client.poll_proposals(SESSION, view.epoch, 0)
 
     def test_client_accepts_overlap_with_new_suffix_from_real_server(self) -> None:
         view = self.client.discover()

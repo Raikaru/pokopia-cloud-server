@@ -15,10 +15,11 @@ over /campaign/live on the game backend, an HTTP/1.1 endpoint behind client cert
   the order game threads reserved them, which need not be the order of concurrent writers' stores; a full
   journal drops changes (the relay then stops); deferred replay effects can appear local (see GuestRelay).
 
-Deliberately not solved here: applying unique-quest changes or guest proposals anywhere (no code here reads
-/campaign/live/proposals), a guest's initial quest state and durable stage checkpoints. A guest starts
-at cursor 0 and replays what the server still holds. Quest changes the host made before its relay attached
-were never journaled. The relay stops with ResyncRequired, and nothing performs that resync, when:
+Deliberately not solved here: applying unique-quest changes or guest proposals anywhere (LiveClient can
+poll proposals, but neither relay consumes them), a guest's initial quest state and durable stage
+checkpoints. A guest starts at cursor 0 and replays what the server still holds. Quest changes the host
+made before its relay attached were never journaled. The relay stops with ResyncRequired, and nothing
+performs that resync, when:
 - an event lowers a quest state, including a reset to 1 (the patch can only raise states to 2..4);
 - the server has discarded history the relay still needs;
 - the epoch or the session changes.
@@ -404,6 +405,25 @@ class ProposalReceipt:
     first: int
     last: int
     added: int
+
+
+@dataclass(frozen=True)
+class ProposedEvent:
+    """An untrusted guest change and its global and per-producer sequence numbers."""
+
+    seq: int
+    producer: str
+    number: int
+    change: Proposal
+
+
+@dataclass(frozen=True)
+class ProposalView:
+    session: str
+    epoch: str
+    first: int
+    last: int
+    proposals: tuple[ProposedEvent, ...]
 
 
 @dataclass(frozen=True)
@@ -889,6 +909,46 @@ def parse_receipt(obj: dict, session: str, epoch: str, count: int) -> ProposalRe
     return ProposalReceipt(first, last, added)
 
 
+def parse_proposals(obj: dict, session: str, epoch: str, after: int) -> ProposalView:
+    """Validate a host's page of untrusted proposals; never apply them to game state."""
+    if obj.keys() != {"session", "epoch", "first", "last", "proposals"}:
+        raise ProtocolError("the server's proposal page has unexpected fields")
+    if (obj["session"], obj["epoch"]) != (session, epoch):
+        raise ProtocolError("the server's proposal page belongs to another session or epoch")
+    first, last = _seq(obj, "first", 1), _seq(obj, "last", 0)
+    if first > last + 1:
+        raise ProtocolError("the server's proposal journal starts past its end")
+    if after > last or after < first - 1:
+        raise ResyncRequired(f"proposal cursor {after} is outside retained history {first}..{last}")
+    raw = obj["proposals"]
+    if not isinstance(raw, list) or len(raw) > MAX_EVENTS_PER_POST:
+        raise ProtocolError("the server's proposal page is not a bounded list")
+    proposals = []
+    for seq, item in enumerate(raw, after + 1):
+        if not isinstance(item, dict) or item.keys() != {"seq", "producer", "number", "event"}:
+            raise ProtocolError(f"the server sent a malformed proposal: {item!r}")
+        if type(item["seq"]) is not int or item["seq"] != seq or seq > last:
+            raise ProtocolError(f"the server's proposal sequence is not contiguous at {seq}")
+        producer, number, event = item["producer"], item["number"], item["event"]
+        if not isinstance(producer, str) or PRODUCER.fullmatch(producer) is None:
+            raise ProtocolError(f"the server sent an invalid proposal producer: {producer!r}")
+        if type(number) is not int or not 1 <= number <= MAX_SEQ:
+            raise ProtocolError(f"the server sent an invalid producer sequence: {number!r}")
+        if not isinstance(event, dict) or (event.keys() != {"kind", "id", "old", "new"}
+                and event.keys() != {"kind", "id", "old", "new", "field", "site"}):
+            raise ProtocolError(f"the server sent a malformed proposal event: {event!r}")
+        try:
+            change = Proposal(**event)
+        except (TypeError, ValueError) as exc:
+            raise ProtocolError(f"the server sent an invalid proposal event: {exc}") from exc
+        if event.keys() != change.payload().keys():
+            raise ProtocolError("the proposal event has fields for the wrong quest kind")
+        proposals.append(ProposedEvent(seq, producer, number, change))
+    if not proposals and last > after:
+        raise ProtocolError(f"the server holds proposals through {last} after {after}, but sent none")
+    return ProposalView(session, epoch, first, last, tuple(proposals))
+
+
 class LiveClient:
     """HTTP/1.1 client of /campaign/live over the mutually authenticated connection to the game backend.
 
@@ -980,6 +1040,13 @@ class LiveClient:
             raise ProtocolError(f"asked for {session} epoch {epoch}, the server answered for {view.session} epoch "
                                 f"{view.epoch}")
         return view
+
+    def poll_proposals(self, session: str, epoch: str, after: int) -> ProposalView:
+        """Poll one page of untrusted guest proposals as the session host, without applying them."""
+        if not _valid_session(session) or not _valid_epoch(epoch) or type(after) is not int or not 0 <= after <= MAX_SEQ:
+            raise ValueError(f"bad proposal poll {session!r} {epoch!r} {after!r}")
+        query = urlencode({"session": session, "epoch": epoch, "after": after}, quote_via=quote, safe="")
+        return parse_proposals(self._request("GET", f"{PROPOSALS_PATH}?{query}"), session, epoch, after)
 
     def post(self, session: str, epoch: str, first: int, events: Sequence[QuestEvent]) -> int:
         """Appends events as seqs first.. (session creator only). Resending the same events at the same seqs
