@@ -358,11 +358,11 @@ def _kernel32():
 class GameProcess:
     """An emulator process running the patched game, addressed with guest addresses.
 
-    pid: the disposable emulator's process; main: the load address it logs as "Module main loaded at ...".
-    The constructor writes nothing. It checks that exactly one host mapping starts at main with the 2.0.1
-    main signature, that every patch byte is in place, and that the mailbox is committed read-write memory.
-    Reads may go anywhere in the game; writes are refused outside the mailbox. The open handle pins the
-    process object, so a reused PID can never be mistaken for the game."""
+    pid: the disposable emulator's process; main: its current "Module main loaded at ..." log address.
+    The constructor writes nothing. It checks the 2.0.1 main signature, the patched bytes, mailbox
+    permissions and 64 KiB arena alignment. Alignment catches some stale main addresses, not all:
+    the address MUST come from this process's current log. Reads may go anywhere in the game; writes
+    are refused outside the mailbox. The open handle pins the process object against PID reuse."""
 
     def __init__(self, pid: int, main: int) -> None:
         if type(pid) is not int or pid <= 0:
@@ -376,6 +376,9 @@ class GameProcess:
             raise ProcessLost(f"cannot open process {pid}: {ctypes.WinError(ctypes.get_last_error())}")
         try:
             self._arena = self._find_main() - main
+            if self._arena <= 0 or self._arena & 0xFFFF:
+                raise PatchMismatch(f"process {pid}: main address {main:#x} does not map to an aligned "
+                                    "guest arena; use this process's current module-load log")
             verify_patch(self.read, main)
             self._check_mailbox_memory()
         except BaseException:

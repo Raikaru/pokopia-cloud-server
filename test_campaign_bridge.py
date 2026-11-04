@@ -848,12 +848,20 @@ class GameProcessTest(unittest.TestCase):
         "k = ctypes.WinDLL('kernel32', use_last_error=True)\n"
         "k.VirtualAlloc.restype = ctypes.c_void_p\n"
         "k.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_uint32]\n"
+        "k.VirtualProtect.restype = ctypes.c_int\n"
+        "k.VirtualProtect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]\n"
         "spec = json.loads(sys.stdin.readline())\n"
         "bases = []\n"
         "for _ in range(spec['copies']):\n"
-        "    base = k.VirtualAlloc(None, spec['size'], 0x3000, 0x04)\n"
-        "    if not base:\n"
+        "    padding = spec['main'] & 0xffff\n"
+        "    allocation = k.VirtualAlloc(None, spec['size'] + padding, 0x3000, 0x04)\n"
+        "    if not allocation:\n"
         "        raise ctypes.WinError(ctypes.get_last_error())\n"
+        "    if padding:\n"
+        "        old = ctypes.c_uint32()\n"
+        "        if not k.VirtualProtect(allocation, padding, 0x01, ctypes.byref(old)):\n"
+        "            raise ctypes.WinError(ctypes.get_last_error())\n"
+        "    base = allocation + padding\n"
         "    for offset, data in spec['writes']:\n"
         "        ctypes.memmove(base + offset, bytes.fromhex(data), len(data) // 2)\n"
         "    bases.append(base)\n"
@@ -874,7 +882,7 @@ class GameProcessTest(unittest.TestCase):
                                  text=True)
         for cleanup in (child.stdout.close, child.stdin.close, child.wait, child.kill):
             self.addCleanup(cleanup)  # run in reverse: kill, wait, then close the pipes
-        child.stdin.write(json.dumps({"copies": copies, "size": cb.MAILBOX + 0x8000, "writes": writes}) + "\n")
+        child.stdin.write(json.dumps({"copies": copies, "size": cb.MAILBOX + 0x8000, "main": MAIN, "writes": writes}) + "\n")
         child.stdin.flush()
         ready = json.loads(child.stdout.readline())
         self.addCleanup(self.terminate, ready["pid"])  # first: the interpreter, which a launcher would outlive
@@ -918,6 +926,11 @@ class GameProcessTest(unittest.TestCase):
             cb.GameProcess(self.spawn(copies=2), MAIN)
         with self.assertRaisesRegex(cb.PatchMismatch, "found 0"):
             cb.GameProcess(self.spawn(copies=0), MAIN)
+
+    def test_refuses_a_stale_main_address(self) -> None:
+        pid = self.spawn()
+        with self.assertRaisesRegex(cb.PatchMismatch, "main address"):
+            cb.GameProcess(pid, MAIN + 0x1000)
 
     def test_refuses_bad_arguments(self) -> None:
         for pid, main in ((0, MAIN), (1, MAIN + 4), (1, 0)):
