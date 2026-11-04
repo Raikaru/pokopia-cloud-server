@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import gzip
 import io
 import json
 import logging
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -89,6 +91,35 @@ def campaign_files(root: Path) -> tuple[dict[str, bytes], str, str]:
     return files, info.campaign, other
 
 
+class SnapshotCancellationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_during_capture_releases_the_late_backup(self) -> None:
+        started, proceed, closed = threading.Event(), threading.Event(), threading.Event()
+
+        class Store:
+            def snapshot(self):
+                return b"{}", [], []
+
+        class Backup:
+            def close(self):
+                closed.set()
+
+        class Registry:
+            def capture_backup(self):
+                started.set()
+                proceed.wait()
+                return Backup()
+
+        task = asyncio.create_task(server.SnapshotService(Store(), Registry()).send(None))
+        try:
+            self.assertTrue(await asyncio.to_thread(started.wait, 5))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            proceed.set()
+        self.assertTrue(await asyncio.to_thread(closed.wait, 5))
+
+
 @unittest.skipUnless(hasattr(socket, "SO_PEERCRED"), "snapshots need Linux")
 class SnapshotTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -152,6 +183,50 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(manifest["files"], {name: manifest_entry(content) for name, content in files.items()})
         self.assertEqual(manifest["damaged_blobs"], [])
         self.assertFalse(self.service.busy)
+
+    def test_campaign_snapshot_captures_acl_and_retained_checkpoints(self) -> None:
+        asyncio.run(self.campaign_snapshot_captures_acl_and_retained_checkpoints())
+
+    async def campaign_snapshot_captures_acl_and_retained_checkpoints(self) -> None:
+        registry = cs.CampaignRegistry(cs.CampaignStore(self.root / "campaigns", min_free_bytes=0))
+        info = registry.create(OWNER)
+        info = registry.add_member(info.campaign, OWNER, FRIEND, if_match=info.etag)
+        first = registry.commit(info.campaign, OWNER, None, **common(0), stages={1: stage_file(1)})
+        second = registry.commit(info.campaign, FRIEND, first.etag, **common(1))
+        with registry.capture_backup() as backup:
+            expected = {f"data/campaigns/{path}": data for path, data in contents(backup).items()}
+        self.service = server.SnapshotService(self.store, registry)
+        async with self.serving():
+            reader, writer = await asyncio.open_unix_connection(self.socket)
+            self.assertEqual(await reader.readline(), b"pokopia-snapshot 1 ok\n")
+            registry.commit(info.campaign, OWNER, second.etag, **common(2))
+            data = await reader.read()
+            writer.close()
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            files = {member.name: archive.extractfile(member).read() for member in archive}
+        manifest = json.loads(files["snapshot.json"])
+        captured = {name: value for name, value in files.items() if name.startswith("data/campaigns/")}
+        self.assertEqual(captured, expected)
+        self.assertEqual(manifest["campaign_inventory"],
+                         {name: manifest_entry(value) for name, value in expected.items()})
+        checked = check_archive(gzip.compress(data), self.root)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        restored = self.root / "restored"
+        for name, value in captured.items():
+            path = restored / name.removeprefix("data/campaigns/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(value)
+        copy = cs.CampaignRegistry(cs.CampaignStore(restored, min_free_bytes=0))
+        self.assertEqual(copy.get(info.campaign, FRIEND).role(FRIEND), "member")
+        self.assertEqual(copy.read(info.campaign, FRIEND).checkpoint, second)
+        returncode, output, errors = await self.run_client()
+        self.assertEqual(returncode, 0, errors)
+        self.assertEqual(self.check(output).returncode, 0)
+        streamed = self.archive_files(output)
+        with registry.capture_backup() as backup:
+            latest = {f"data/campaigns/{path}": data for path, data in contents(backup).items()}
+        self.assertEqual({name: value for name, value in streamed.items() if name.startswith("data/campaigns/")},
+                         latest)
 
     def test_stalled_client_is_dropped(self) -> None:
         asyncio.run(self.stalled_client_is_dropped())
