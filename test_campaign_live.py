@@ -24,8 +24,10 @@ import h2.config
 import h2.connection
 import h2.events
 
+import campaign_store as cs
 import server
 from server import Msg, encode
+from test_campaign_store import common
 
 TENANT = "tenants/t-test"
 SESSION_ID = ":K5Y67P9D4Q8V"  # Synthetic host session identifier.
@@ -200,6 +202,29 @@ class Bridge:
         if not ended:
             raise AssertionError("the response did not end")
         return status, response_headers, bytes(payload)
+
+
+class CampaignAccountPurgeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_deleted_members_and_owners_are_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            instance = server.Server(argparse.Namespace(
+                data_dir=Path(directory), storage_url="https://storage.invalid", max_storage_mb=1024,
+                max_players=4, stun="", stun_port=0, gamesync_port=443, port=None, client_ca=None, auth_db=None))
+            registry = instance.campaigns
+            campaign = registry.create("owner")
+            registry.add_member(campaign.campaign, "owner", "guest", if_match=campaign.etag)
+            saved = registry.commit(campaign.campaign, "owner", None, **common(1))
+            instance.auth = mock.Mock()
+            instance.auth.deleted_accounts.return_value = {"guest"}
+            await instance.purge_deleted_accounts_once()
+            with self.assertRaises(cs.CampaignNotFound):
+                registry.get(campaign.campaign, "guest")
+            self.assertEqual(registry.read(campaign.campaign, "owner").checkpoint, saved)
+            instance.auth.deleted_accounts.return_value = {"owner"}
+            await instance.purge_deleted_accounts_once()
+            with self.assertRaises(cs.CampaignNotFound):
+                registry.get(campaign.campaign, "owner")
+            self.assertTrue(registry.purged("owner"))
 
 
 class CampaignLiveTest(unittest.IsolatedAsyncioTestCase):

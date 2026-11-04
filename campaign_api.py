@@ -2,17 +2,13 @@
 sharing them, and committing and reading their checkpoints, for the portal account behind a
 client-certificate connection.
 
-NOT WIRED IN. server.py does not dispatch to CampaignApi, and must not until three integrations
-exist; without them a campaign could outlive its owner's deleted account, escape the storage quota,
-or come back from a backup without anyone allowed to use it:
-  * Backups: server.py's snapshots include the whole registry (CampaignRegistry.capture_backup:
-    metadata, every retained checkpoint, tombstones and purge markers), not only state.json and blobs.
-  * Quotas: campaign bytes (CampaignStore.usage) count against Storage.room_for's per-account and
-    --max-storage-mb limits; the store applies only its own max_campaign_bytes and min_free_bytes.
-  * Account deletion: purge_deleted_accounts calls CampaignRegistry.purge_account for every deleted
-    account that CampaignRegistry.accounts() names.
+NOT WIRED IN. server.py snapshots the registry and replays account deletion, but must not dispatch
+to CampaignApi until campaign storage is charged against the server and owner quotas, and commits
+are fenced against a host leaving or the session being rebound after authorization. The API's
+host_session check happens before disk work, so it is not by itself such a fence. A checkpoint also
+needs an atomic relationship to the live event cursor; none is established here.
 
-Wiring, for server.py once they exist:
+Wiring, for server.py once those guarantees exist:
   * Dispatch: a request whose target is_campaign_api() goes to `await CampaignApi.handle(method,
     target, headers, body, principal)` instead of Storage.handle, with the connection's Principal
     (None in local mode, which authenticates nobody and is refused everything) and the header dict

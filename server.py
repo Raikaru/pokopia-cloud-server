@@ -98,6 +98,8 @@ from pathlib import Path
 from typing import AsyncIterator, BinaryIO, Callable, Iterable, NamedTuple
 from urllib.parse import parse_qsl, quote, urlsplit
 
+import campaign_store
+
 try:
     import fcntl  # POSIX: F_FULLFSYNC on macOS
 except ImportError:
@@ -4704,13 +4706,15 @@ class SnapshotService:
     or "pokopia-snapshot 1 denied". After "ok" comes a tar stream: data/state.json,
     data/blobs/<id> for each blob that state refers to, and last snapshot.json with the size and
     SHA-256 of each file and "damaged_blobs": every referenced blob whose file is missing or not the
-    size the state records. Store.snapshot captures all of it at one moment, and other requests go
-    on being served while it streams. Only root and the server's own user are served, one at a
-    time. A failure closes the connection with the tar stream unfinished. snapshot.py is the client.
+    size the state records. Store.snapshot captures those files at one moment. If a campaign registry
+    is provided, its files and independent inventory are captured separately; the two stores are not
+    one atomic snapshot. Other requests continue while the snapshot streams. Only root and the
+    server's own user are served, one at a time. Failure leaves the stream unfinished.
     """
 
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, campaigns: campaign_store.CampaignRegistry | None = None):
         self.store = store
+        self.campaigns = campaigns
         self.busy = False
 
     async def on_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -4729,7 +4733,7 @@ class SnapshotService:
                     await self.send(writer)
                 finally:
                     self.busy = False
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (OSError, asyncio.TimeoutError, campaign_store.CampaignError) as exc:
             log.warning("snapshot not sent: %r", exc)
         finally:
             writer.close()
@@ -4737,7 +4741,21 @@ class SnapshotService:
     async def send(self, writer: asyncio.StreamWriter) -> None:
         created = time.time()
         state, blobs, damaged = self.store.snapshot()
+        campaign_backup = None
         try:
+            if self.campaigns is not None:
+                capture = asyncio.create_task(asyncio.to_thread(self.campaigns.capture_backup))
+                try:
+                    campaign_backup = await asyncio.shield(capture)
+                except BaseException:
+                    # Cancellation cannot stop a thread. Close its result when capture completes.
+                    def discard(task: asyncio.Task) -> None:
+                        try:
+                            task.result().close()
+                        except BaseException:
+                            log.exception("failed to discard cancelled campaign backup")
+                    capture.add_done_callback(discard)
+                    raise
             sent = 0
             files: dict[str, dict] = {}
 
@@ -4747,14 +4765,15 @@ class SnapshotService:
                 writer.write(data)
                 await asyncio.wait_for(writer.drain(), SNAPSHOT_STALL_SECONDS)
 
-            async def add(name: str, size: int, read: Callable[[int, int], bytes]) -> None:
+            async def add(name: str, size: int, read: Callable[[int, int], bytes], *, threaded: bool = False) -> None:
                 info = tarfile.TarInfo(name)
                 info.size, info.mtime, info.mode = size, int(created), 0o600
                 await put(info.tobuf(tarfile.PAX_FORMAT))
                 digest = hashlib.sha256()
                 offset = 0
                 while offset < size:
-                    chunk = read(offset, min(SNAPSHOT_CHUNK_SIZE, size - offset))
+                    count = min(SNAPSHOT_CHUNK_SIZE, size - offset)
+                    chunk = await asyncio.to_thread(read, offset, count) if threaded else read(offset, count)
                     if not chunk:
                         raise OSError(f"{name} ended after {offset} of {size} bytes")
                     digest.update(chunk)
@@ -4767,10 +4786,18 @@ class SnapshotService:
             await add("data/state.json", len(state), lambda offset, n: state[offset : offset + n])
             for blob_id, fd, size in blobs:
                 await add(f"data/blobs/{blob_id}", size, lambda offset, n, fd=fd: os.pread(fd, n, offset))
+            inventory = None
+            if campaign_backup is not None:
+                inventory = {f"data/campaigns/{file.path}": {"size": file.size, "sha256": file.sha256}
+                             for file in campaign_backup.files}
+                for file in campaign_backup.files:
+                    await add(f"data/campaigns/{file.path}", file.size, file.read, threaded=True)
             if damaged:
                 log.warning("snapshot: damaged blobs: %s", "; ".join(damaged))
-            manifest = json.dumps({"format": 1, "created": created, "files": files,
-                                   "damaged_blobs": damaged}, indent=1).encode()
+            metadata = {"format": 1, "created": created, "files": files, "damaged_blobs": damaged}
+            if inventory is not None:
+                metadata["campaign_inventory"] = inventory
+            manifest = json.dumps(metadata, indent=1).encode()
             await add("snapshot.json", len(manifest), lambda offset, n: manifest[offset : offset + n])
             end = bytes(2 * tarfile.BLOCKSIZE)
             await put(end + bytes(-(sent + len(end)) % tarfile.RECORDSIZE))
@@ -4778,6 +4805,9 @@ class SnapshotService:
         finally:
             for _, fd, _ in blobs:
                 os.close(fd)
+            if campaign_backup is not None:
+                # A cancelled read may still hold the backup lock in its worker.
+                await asyncio.to_thread(campaign_backup.close)
 
 
 def raise_open_file_limit() -> None:
@@ -4795,6 +4825,7 @@ def raise_open_file_limit() -> None:
 class Server:
     def __init__(self, args: argparse.Namespace, turn: TurnServer | None = None, relay: RelayOnly | None = None):
         self.store = Store(args.data_dir)
+        self.campaigns = campaign_store.CampaignRegistry(campaign_store.CampaignStore(args.data_dir / "campaigns"))
         self.storage = Storage(self.store, args.storage_url.rstrip("/"))
         self.storage.max_bytes = args.max_storage_mb * 1024 * 1024
         self.backend = Backend(self.store, self.storage, args.max_players, advertised_stun(args),
@@ -4928,16 +4959,32 @@ class Server:
                 writer.close()
                 return
 
+    async def purge_deleted_accounts_once(self) -> None:
+        """Purge deleted accounts from game data and campaigns; incomplete campaign work retries."""
+        deleted = self.auth.deleted_accounts()
+        if not deleted:
+            return
+        owners = {user.get("owner") for user in self.store.users.values()}
+        owners.update(upload.get("owner") for upload in self.store.uploads.values())
+        for account in deleted & owners:
+            self.backend.purge_account(account)
+        try:
+            campaign_accounts = await asyncio.to_thread(self.campaigns.accounts)
+        except campaign_store.CampaignError:
+            log.exception("could not enumerate campaign accounts for deletion; will retry")
+            return
+        for account in deleted & campaign_accounts:
+            try:
+                result = await asyncio.to_thread(self.campaigns.purge_account, account)
+                if result.unfinished:
+                    log.warning("campaign purge for %s is incomplete; will retry", account)
+            except campaign_store.CampaignError:
+                log.exception("campaign purge for %s failed; will retry", account)
+
     async def purge_deleted_accounts(self) -> None:
-        """Client-certificate mode: purges the game data of accounts deleted on the portal
-        (`portal.py delete`), at startup and then every minute."""
+        """Purge deleted portal accounts at startup and then every minute."""
         while True:
-            deleted = self.auth.deleted_accounts()
-            if deleted:
-                owners = {user.get("owner") for user in self.store.users.values()}
-                owners.update(upload.get("owner") for upload in self.store.uploads.values())
-                for account in deleted & owners:
-                    self.backend.purge_account(account)
+            await self.purge_deleted_accounts_once()
             await asyncio.sleep(60)
 
 
@@ -4980,7 +5027,7 @@ async def serve(args: argparse.Namespace, turn: TurnServer | None = None, relay:
         log.info("STUN (UDP) on %s:%d", args.bind, args.stun_port)
     if args.snapshot_socket:
         raise_open_file_limit()
-        snapshots = SnapshotService(server.store)
+        snapshots = SnapshotService(server.store, server.campaigns)
         listeners.append(await asyncio.start_unix_server(snapshots.on_connection, args.snapshot_socket))
         os.chmod(args.snapshot_socket, 0o600)
         log.info("backup snapshots on %s", args.snapshot_socket)
