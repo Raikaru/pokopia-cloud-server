@@ -132,15 +132,17 @@ HOOKS = {
 if hashlib.sha256(CAVE_CODE).hexdigest() != CAVE_CODE_SHA256:
     raise ImportError("campaign_bridge: the embedded cave code is corrupt")
 
-MAILBOX, MAILBOX_SIZE = 0x3D18000, 0xC00  # includes the inactive unique-quest journal
+MAILBOX, MAILBOX_SIZE = 0x3D18000, 0xC00
 MAGIC = 0x31425351  # "QSB1"; the caves stay inert until it is written
 MB_MAGIC, MB_FLAGS, MB_APPLYING, MB_APPLIED = 0x00, 0x04, 0x08, 0x0C
 MB_IN_W, MB_IN_R, MB_OUT_W = 0x10, 0x14, 0x18
 MB_SKIP_MASK, MB_SKIPPED = 0x20, 0x28
+MB_UJ_W, MB_UJ_R, MB_UJ_LOST, MB_UJ_GAP = 0x50, 0x54, 0x58, 0x5C
 MB_INBOX, INBOX_SLOTS = 0x100, 64  # u32 id | target << 16 | op << 24; written here, drained by cave D
 MB_JOURNAL, JOURNAL_SLOTS = 0x200, 128  # u32 id | old << 16 | new << 20 | origin << 24; written by cave J
+MB_UNIQUE_JOURNAL, UNIQUE_JOURNAL_SLOTS = 0x400, 256  # u32 event, u32 commit sequence
 HEADER_SIZE = MB_INBOX
-FLAG_DRAIN, FLAG_JOURNAL = 1, 2
+FLAG_DRAIN, FLAG_JOURNAL, FLAG_UNIQUE_JOURNAL = 1, 2, 4
 OP_GAME, OP_FORCE4 = 0, 1  # the patch's op 2 (raw state write) is never sent
 # Quest effect types the guest skips while replaying: 22 and 24 edit world blocks (see quest_bridge.py).
 DEFAULT_SKIP_MASK = (1 << 22) | (1 << 24)
@@ -284,6 +286,30 @@ class JournalEntry:
     @classmethod
     def decode(cls, word: int) -> JournalEntry:
         return cls(word & 0xFFFF, word >> 16 & 0xF, word >> 20 & 0xF, word >> 24 & 0xFF)
+
+
+@dataclass(frozen=True)
+class UniqueJournalEntry:
+    """A unique-quest byte change, in reservation order (not necessarily completion order)."""
+
+    sequence: int
+    id: int
+    field: str  # state or counter
+    old: int
+    new: int
+    origin: int  # 0 game, 1 CAS replay, 2 side effect on the drain thread
+    site: int
+
+    @classmethod
+    def decode(cls, sequence: int, word: int) -> UniqueJournalEntry:
+        quest_id, old, new = word & 0xFF, word >> 8 & 0xFF, word >> 16 & 0xFF
+        field = "counter" if word >> 24 & 1 else "state"
+        origin, site = word >> 25 & 3, word >> 27 & 15
+        if (word >> 31 or quest_id not in range(1, 201) or old == new or origin > 2 or site == 14
+                or (site == 15) != (origin == 1)
+                or (field == "state" and (old > 5 or new not in range(1, 6)))):
+            raise MailboxError(f"invalid or gap-marked unique quest journal entry {word:#010x}")
+        return cls(sequence, quest_id, field, old, new, origin, site)
 
 
 @dataclass(frozen=True)
@@ -476,20 +502,21 @@ class GameProcess:
 # --- The mailbox ------------------------------------------------------------------------------------------
 
 class Mailbox:
-    """The relay's side of the patch mailbox in one game, the same protocol as quest_bridge.Mailbox. The game
-    writes in_r, applied, applying, skipped, out_w and the journal; this object writes the rest, and nothing
-    else does. check() makes sure the mailbox still holds what was written to it and that the game's indices
-    make sense, which catches a game that restarted, memory that was reused, or another writer."""
+    """The relay's side of the patch mailbox in one game. The game writes the inbox read index,
+    counters and journal entries; this object owns the inbox write index and unique-journal read index.
+    check() detects a restarted game, a foreign writer and journal overflow."""
 
-    def __init__(self, game: Game, *, drain: bool, journal: bool, skip_mask: int = DEFAULT_SKIP_MASK) -> None:
+    def __init__(self, game: Game, *, drain: bool, journal: bool, unique_journal: bool = False,
+                 skip_mask: int = DEFAULT_SKIP_MASK) -> None:
         if type(skip_mask) is not int or not 0 <= skip_mask < 1 << 64:
             raise ValueError(f"bad effect skip mask {skip_mask!r}")
         self.game = game
         self.base = game.main + MAILBOX
-        self.flags = (FLAG_DRAIN if drain else 0) | (FLAG_JOURNAL if journal else 0)
+        self.flags = ((FLAG_DRAIN if drain else 0) | (FLAG_JOURNAL if journal else 0)
+                      | (FLAG_UNIQUE_JOURNAL if unique_journal else 0))
         self.skip_mask = skip_mask
         self.attached = False
-        self.in_w = self.in_r = self.out_r = 0
+        self.in_w = self.in_r = self.out_r = self.unique_r = 0
         self.applied = self.skipped = 0
 
     def attach(self) -> None:
@@ -497,6 +524,8 @@ class Mailbox:
         attachment or to a game that is not fresh, and is refused before anything is written."""
         if self.attached:
             raise RuntimeError("the mailbox is already attached")
+        if self.flags & FLAG_UNIQUE_JOURNAL:
+            verify_patch(self.game.read, self.game.main)
         if self.game.read(self.base, MAILBOX_SIZE) != bytes(MAILBOX_SIZE):
             raise MailboxError("the quest mailbox is not pristine; start a fresh game before attaching")
         self.game.write(self.base + MB_SKIP_MASK, struct.pack("<Q", self.skip_mask))
@@ -514,6 +543,26 @@ class Mailbox:
     def _u32(self, offset: int) -> int:
         return struct.unpack("<I", self.game.read(self.base + offset, 4))[0]
 
+    def _unique_end(self, header: bytes) -> int:
+        if struct.unpack_from("<I", header, MB_MAGIC)[0] != MAGIC:
+            raise MailboxError("the quest mailbox lost its contents")
+        if struct.unpack_from("<I", header, MB_FLAGS)[0] != self.flags:
+            raise MailboxError("the quest mailbox flags changed")
+        written, read, lost, gap = struct.unpack_from("<4I", header, MB_UJ_W)
+        if not self.flags & FLAG_UNIQUE_JOURNAL:
+            if written or read or lost or gap:
+                raise MailboxError("the disabled unique quest journal was changed")
+            return 0
+        if read != self.unique_r:
+            raise MailboxError("the unique quest journal read index was changed")
+        if lost or gap:
+            raise MailboxError("the unique quest journal lost changes; resynchronization is required")
+        if written < read or written >= U32 - UNIQUE_JOURNAL_SLOTS:
+            raise MailboxError("the unique quest journal sequence is invalid or exhausted")
+        if written - read > UNIQUE_JOURNAL_SLOTS:
+            raise MailboxError("the unique quest journal exceeds its capacity")
+        return written
+
     def check(self) -> int:
         """Validates the header and returns how many inbox entries the game took since the last check."""
         if not self.attached:
@@ -524,9 +573,10 @@ class Mailbox:
         if magic != MAGIC:
             raise MailboxError("the quest mailbox lost its contents (the game restarted or its memory was reset)")
         if (flags != self.flags or skip_mask != self.skip_mask or applying > 1 or in_w != self.in_w
-                or header[0x1C:MB_SKIP_MASK] != bytes(4) or header[0x2C:0x60] != bytes(0x34)
+                or header[0x1C:MB_SKIP_MASK] != bytes(4) or header[0x2C:MB_UJ_W] != bytes(0x24)
                 or header[0x68:] != bytes(HEADER_SIZE - 0x68)):
             raise MailboxError("the quest mailbox was changed by someone other than this relay and the game")
+        self._unique_end(header)
         taken = (in_r - self.in_r) & U32
         if taken > (self.in_w - self.in_r) & U32:
             raise MailboxError("the game's inbox read index is past the entries this relay queued")
@@ -551,6 +601,26 @@ class Mailbox:
             raise MailboxError("the quest journal overflowed while it was read; quest changes were lost")
         self.out_r = end
         return [JournalEntry.decode(ring[(start + i) % JOURNAL_SLOTS]) for i in range(count)]
+
+    def read_unique_journal(self) -> list[UniqueJournalEntry]:
+        """Read committed unique-quest changes in reservation order. A loss or a changed read index
+        stops the relay; an uncommitted reservation is left for the next call."""
+        if not self.attached or not self.flags & FLAG_UNIQUE_JOURNAL:
+            raise RuntimeError("the unique quest journal is not attached")
+        end = self._unique_end(self.game.read(self.base, HEADER_SIZE))
+        sequence = self.unique_r
+        events = []
+        while sequence < end:
+            slot = MB_UNIQUE_JOURNAL + 8 * (sequence % UNIQUE_JOURNAL_SLOTS)
+            if self._u32(slot + 4) != sequence + 1:
+                break
+            events.append(UniqueJournalEntry.decode(sequence, self._u32(slot)))
+            sequence += 1
+        self._unique_end(self.game.read(self.base, HEADER_SIZE))
+        if events:
+            self.game.write(self.base + MB_UJ_R, struct.pack("<I", sequence))
+            self.unique_r = sequence
+        return events
 
     def push(self, words: Sequence[int]) -> int:
         """Queues as many of words, in order, as the 64-slot inbox has room for (as of the last check) and
