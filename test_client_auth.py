@@ -558,9 +558,9 @@ class ClientAuthTest(unittest.TestCase):
         finally:
             file.close()
 
-    def test_host_the_owner_handed_over_to_saves_the_island(self) -> None:
-        # The owner leaves its island to the guest, who hosts it from then on, maybe longer after
-        # joining than a password grant lasts: it reads the island and saves it for the owner.
+    def test_transferred_host_cannot_overwrite_island(self) -> None:
+        # Until current-host authorization is available, even the transferred host must not save
+        # another account's island; it can still read the island after the grant expires.
         stage = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{self.complete_upload()}")))))
         session = self.join_island()
@@ -568,20 +568,15 @@ class ClientAuthTest(unittest.TestCase):
         self.assertEqual(list(session.user_sessions), [self.guest.user])
         self.assertIs(self.backend.sessions[session.name], session)
         self.assertEqual(session.island, self.host.user)
-        upload_id = self.guest_upload()
-        blob = self.store.uploads[upload_id]["blob"]
+        save = self.island_save(self.guest_upload())
         with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
             self.assertEqual(self.guest.get(stage).get_str(1), stage)
             self.assertEqual(self.download_stage(self.guest), b"island")
-            with self.assertLogs(server.log, "INFO") as logs:
-                self.guest.commit(*self.island_save(upload_id), context=island_context(PASSWORD))
-        self.assertTrue(any("saves the island" in line for line in logs.output))
-        self.assertEqual(self.store.documents[stage]["attachment"]["blob"], blob)
-        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
-        metadata = server.map_entries(self.host.get(f"{self.host.documents}/public/MetaData").get_bytes(2))
-        self.assertEqual(metadata["ownerPlayerName"], text("host"))
+            self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save,
+                               context=island_context(PASSWORD))
+        self.assertEqual(self.download_stage(self.host), b"island")
 
-    def test_visitor_hosts_and_saves_the_island_while_the_owner_is_away(self) -> None:
+    def test_visitor_hosts_the_island_while_the_owner_is_away(self) -> None:
         stage = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((2, encode((1, stage)))))  # the owner left before saving it once
         self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
@@ -595,10 +590,9 @@ class ClientAuthTest(unittest.TestCase):
         self.assertEqual([entry.get_str(1) for entry in other.query()], [session.name])
         other.join(session, PASSWORD)
         self.assertEqual([entry.get_str(1) for entry in self.host.query()], [session.name])
-        upload_id = self.guest_upload()
         with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
-            self.guest.commit(*self.island_save(upload_id), context=island_context(PASSWORD))
-            self.assertEqual(self.download_stage(other), b"saved by the guest")
+            self.assert_status(server.PERMISSION_DENIED, self.guest.commit,
+                               *self.island_save(self.guest_upload()), context=island_context(PASSWORD))
 
     def test_a_session_only_hosts_an_island_its_creator_may_open(self) -> None:
         # The stranger names the island's session id without having given the island password.
@@ -612,38 +606,21 @@ class ClientAuthTest(unittest.TestCase):
         self.assert_status(server.PERMISSION_DENIED, stranger.commit, update(stage, {}),
                            context=island_context(PASSWORD))
 
-    def test_island_save_needs_a_member_with_the_island_password(self) -> None:
+    def test_member_cannot_write_another_accounts_island(self) -> None:
+        self.join_island()
         stage = f"{self.host.documents}/private/StageData"
-        save = self.island_save(self.guest_upload())
-        context = island_context(PASSWORD)
-        # A password grant alone, without a user in the island's session, saves nothing.
-        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
-        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save, context=context)
-        self.guest.join(self.host.host(), PASSWORD)
-        # A member needs the island password in the commit's rule context; a commit is one guess.
-        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save)
-        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save, context=island_context("WRONG0"))
-        self.assertEqual(len(self.backend.guesses.failures[("account", self.guest.principal.account)]), 2)
-        # Only the writes of a save.
         metadata = f"{self.host.documents}/public/MetaData"
-        uri = f"https://storage.invalid/upload/{self.guest_upload()}"
-        refused = [
-            encode((2, encode((1, stage)))),  # delete
-            encode((3, encode((1, stage), (2, b"x"), (4, "application/octet-stream")))),  # attachment body
-            encode((5, encode((1, metadata), (2, uri)))),  # import into MetaData
-            update(f"{self.host.documents}/private/PasswordData", {"password": text("MINE00")}),
-            update(f"{self.host.documents}/private/SessionIDData", {"sessionID": text("ELSEWHERE")}),
-            update(f"{self.host.documents}/public/Extra", {}),
-        ]
-        for index, write in enumerate(refused):
-            with self.subTest(index=index):
-                self.assert_status(server.PERMISSION_DENIED, self.guest.commit, write, context=context)
-        self.guest.commit(*save, context=context)
-        # A new password ends membership, even for a member who learns it.
-        self.host.commit(update(f"{self.host.documents}/private/PasswordData", {"password": text("NEW123")}))
-        self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
-        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}),
-                           context=island_context("NEW123"))
+        save = self.island_save(self.guest_upload())
+        original_stage = self.store.documents.get(stage)
+        original_metadata = self.store.documents.get(metadata)
+        # The password and current membership authorize reading, not writing either save document
+        # or importing an attachment. Test each operation separately and as one atomic commit.
+        for writes in [(save[0],), (save[1],), (save[2],), save]:
+            with self.subTest(writes=len(writes)):
+                self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *writes,
+                                   context=island_context(PASSWORD))
+        self.assertEqual(self.store.documents.get(stage), original_stage)
+        self.assertEqual(self.store.documents.get(metadata), original_metadata)
 
     def test_island_membership_ends_with_the_members_game(self) -> None:
         stage = f"{self.host.documents}/private/StageData"
@@ -657,15 +634,6 @@ class ClientAuthTest(unittest.TestCase):
                                    context=island_context(PASSWORD))
             self.backend.drop_user_session(session, self.guest.user)
             self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
-
-    def test_island_save_counts_against_the_owners_quota(self) -> None:
-        self.join_island()
-        save = self.island_save(self.guest_upload(b"x" * 100))
-        with mock.patch.object(server, "ACCOUNT_BLOB_BYTES", 50):
-            self.assert_status(server.RESOURCE_EXHAUSTED, self.guest.commit, *save, context=island_context(PASSWORD))
-        self.guest.commit(*save, context=island_context(PASSWORD))
-        self.assertEqual(self.storage.usage(self.host.principal.account)[1], 100)
-        self.assertEqual(self.storage.usage(self.guest.principal.account)[1], 0)
 
     # Account deletion
 

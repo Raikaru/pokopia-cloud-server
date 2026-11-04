@@ -157,13 +157,6 @@ GUESS_TRUST_SECONDS = 30 * 86400
 PASSWORD_GRANT_SECONDS = 600
 # The Ugcstore documents the game uses: tenants/<t>/documents/users/<u>/(public|private)/<name>.
 USER_DOCUMENT = re.compile(r"(tenants/[^/]+)/documents/users/([^/]+)/(public|private)/(.+)")
-# What the game commits when it saves a Cloud Island, whichever player hosts it: a visitor opens
-# the island while its owner is away, and the owner hands hosting to another player on leaving, so
-# the host saves the island to the owner's documents. A save updates these documents (by name
-# below the user) and imports its upload as the attachment of these, with the island's sessionID
-# and password as the commit's rule context.
-ISLAND_SAVE_UPDATES = frozenset({"private/StageData", "public/MetaData"})
-ISLAND_SAVE_IMPORTS = frozenset({"private/StageData"})
 
 # Resource limits, in every mode. The island's StageData upload was 2.8 MB.
 MAX_GRPC_MESSAGE_BYTES = 4 * 1024 * 1024  # one gRPC message after decompression (gRPC's default)
@@ -1312,15 +1305,11 @@ def check_precondition(name: str, doc: dict | None, precondition: Msg | None) ->
 class Staging:
     """Uncommitted document changes of one commit."""
 
-    def __init__(self, documents: dict[str, dict], rule_context: bytes | None = None):
+    def __init__(self, documents: dict[str, dict]):
         self.documents = documents
-        self.rule_context = rule_context  # the commit's; a Cloud Island save sends sessionID and password
         self.changes: dict[str, dict | None] = {}
         self.imported_uploads: list[str] = []
         self.new_blobs: list[str] = []
-        # owner -> whether this commit may save that owner's Cloud Island (Backend.check_write_access),
-        # decided once per commit so that a wrong password counts once
-        self.island_saves: dict[str, bool] = {}
 
     def get(self, name: str) -> dict | None:
         return self.changes[name] if name in self.changes else self.documents.get(name)
@@ -2671,9 +2660,9 @@ class Backend:
         of its own users (tenants/<t>/documents/users/<u>/...). Of another account's documents it
         only reads public/ ones, private/SessionIDData given that island's password as rule context
         "password" (as when joining a Cloud Island) and private/StageData for PASSWORD_GRANT_SECONDS
-        after that or while it is in that island's game session (island_member). Writes (but a
-        Cloud Island save, check_write_access), other attachment URIs and all other documents are
-        the owner's alone. The account comes from the connection, so this does not depend on a
+        after that or while it is in that island's game session (island_member). Writes, other
+        attachment URIs and all other documents are the owner's alone. The account comes from the
+        connection, so this does not depend on a
         bearer token."""
         if call.principal is None:
             return
@@ -2739,10 +2728,9 @@ class Backend:
     def island_member(self, call: Call, owner: str) -> bool:
         """Whether a user of the caller's account is in a game session that hosts `owner`'s Cloud
         Island (GameSession.island, or else its creator), its game is still there
-        (user_session_gone), and it joined under `owner`'s current island password. Any such player
-        may host the island: the owner hands hosting over on leaving, and a visitor opens it while
-        the owner is away. The host reads and saves the island, however long after joining. A new or
-        removed password ends this, as it ends grants."""
+        (user_session_gone), and it joined under `owner`'s current island password. Membership
+        permits reading the island for as long as the game is present. A new or removed password
+        ends this, as it ends grants."""
         if not self.island_password(owner):
             return False
         version = self.island_password_version(owner)
@@ -2762,30 +2750,6 @@ class Backend:
         call, owner = Call("", {}, principal), document_owner(name)
         return self.has_grant(call, owner) or self.island_member(call, owner)
 
-    def check_write_access(self, call: Call, name: str, staging: Staging, island_documents: frozenset[str]) -> None:
-        """check_document_access(owner_only=True) for a write of a commit, except that the commit may
-        also write the `island_documents` (ISLAND_SAVE_UPDATES, ISLAND_SAVE_IMPORTS) of another
-        account's user when it saves that user's Cloud Island (may_save_island). They need not exist
-        yet: an island its owner left before saving it once has no StageData."""
-        match = USER_DOCUMENT.fullmatch(name)
-        if call.principal is not None and match and "/".join(match.group(3, 4)) in island_documents:
-            owner = document_owner(name)
-            if not self.owns(call, owner):
-                if owner not in staging.island_saves:
-                    staging.island_saves[owner] = self.may_save_island(call, owner, staging.rule_context)
-                if staging.island_saves[owner]:
-                    return
-        self.check_document_access(call, name, owner_only=True)
-
-    def may_save_island(self, call: Call, owner: str, rule_context: bytes | None) -> bool:
-        """Whether the caller may save `owner`'s Cloud Island as its host: a user of its account is
-        in the island's game session (island_member), and the commit's rule context holds the
-        island's current password, as the game sends it with every save (wrong ones count as
-        guesses, check_password)."""
-        if not (self.island_member(call, owner) and self.check_island_password(call, owner, rule_context)):
-            return False
-        log.info("account %s saves the island of %s as its host", call.principal.account, owner)
-        return True
 
     def check_island_password(self, call: Call, owner: str, rule_context: bytes | None) -> bool:
         """Whether the rule context carries the password of `owner`'s private/PasswordData."""
@@ -2820,9 +2784,8 @@ class Backend:
 
     def check_commit_room(self, call: Call, staging: Staging) -> None:
         """Refuses a Ugcstore commit that would break a document or storage limit (Storage.room_for,
-        MAX_DOCUMENTS_PER_USER). A document's growth counts against the account of its user, which
-        for a Cloud Island save (check_write_access) is not the committing account; an imported
-        upload leaves the committing account's, which uploaded it. Each upload a commit imports
+        MAX_DOCUMENTS_PER_USER). Each imported upload leaves the committing account's storage and
+        counts against the document owner's account. Each upload a commit imports
         counts once, as apply_write refuses importing one twice. Shrinking always passes."""
         account = call.principal.account if call.principal is not None else None
         growth: dict[str | None, list[int]] = {}  # account -> [state bytes, blob bytes]
@@ -2881,7 +2844,7 @@ class Backend:
 
     def commit_documents(self, call: Call, req: Msg) -> bytes:
         now = time.time_ns()
-        staging = Staging(self.store.documents, req.get_bytes(3))
+        staging = Staging(self.store.documents)
         try:
             results = [self.apply_write(call, op, staging, now) for op in req.get_msgs(2)]
             self.check_commit_room(call, staging)
@@ -2915,7 +2878,7 @@ class Backend:
         if (update := op.get_msg(1)) is not None:
             document = update.get_msg(1) or Msg()
             name = self.resolve(call, document.get_str(1))
-            self.check_write_access(call, name, staging, ISLAND_SAVE_UPDATES)
+            self.check_document_access(call, name, owner_only=True)
             check_name(name)
             doc = staging.get(name)
             check_precondition(name, doc, update.get_msg(3))
@@ -2987,7 +2950,7 @@ class Backend:
 
         if (imported := op.get_msg(5)) is not None:
             name = self.resolve(call, imported.get_str(1))
-            self.check_write_access(call, name, staging, ISLAND_SAVE_IMPORTS)
+            self.check_document_access(call, name, owner_only=True)
             check_name(name)
             check_name(imported.get_str(3))
             uri = imported.get_str(2)
