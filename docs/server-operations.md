@@ -168,9 +168,10 @@ the server or restarting the host's game loses them. They are not campaign check
 `/campaign/live` carries host story-quest transitions. `/campaign/live/proposals` is a separate
 queue for guest changes: it is **not connected to the launcher**, only the experimental
 `campaign_bridge.py` guest relay posts to it, and only when explicitly created with `propose=True`.
-Nothing reads or applies the queue on the host yet. Proposals are untrusted input, not
-authoritative events. A host must validate a proposal against its own game state and side effects
-before acting; blindly replaying the bytes can produce incorrect progression.
+`LiveClient.poll_proposals` can read and validate a page as the host, but neither relay consumes or
+applies it. Proposals are untrusted input, not authoritative events. A host must validate each
+proposal against its own game state and side effects before acting; blindly replaying the bytes can
+produce incorrect progression.
 Both endpoints require client-certificate authentication and active session membership.
 
 For a proposal client, POST JSON to `/campaign/live/proposals` with `session`, `epoch`,
