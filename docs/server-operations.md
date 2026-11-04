@@ -163,6 +163,32 @@ Backups do not depend on these flushes: snapshots read the files they hold open 
 
 Matchmaking sessions, creation tickets and Gamesync documents are kept in memory only. They are lost when the server restarts. Gamesync calls made with a token issued before the restart then fail with `NOT_FOUND`, because the token's user session no longer exists.
 
+The experimental story-co-op journals also live only for a matchmaking session and epoch; restarting
+the server or restarting the host's game loses them. They are not campaign checkpoints.
+`/campaign/live` carries host story-quest transitions. `/campaign/live/proposals` is a separate
+queue for guest changes: it is **not yet connected to the launcher or relays**, and proposals are
+untrusted input, not authoritative events. A host must validate a proposal against its own game
+state and side effects before acting; blindly replaying the bytes can produce incorrect progression.
+Both endpoints require client-certificate authentication and active session membership.
+
+For a future proposal client, POST JSON to `/campaign/live/proposals` with `session`, `epoch`,
+`producer`, `first` and `events`. `producer` is a randomly generated, lowercase 32-hex-digit ID
+owned by the posting account for the epoch; `first` is that producer's sequence number, starting
+at 1. A story event has `kind`, `id`, `old`, `new` (`kind` is `story`); a unique-quest event also
+has `field` (`state` or `counter`) and the patch's natural writer `site` (0–13). A successful
+POST reports `added` and the global `first`/`last` bounds. Identical retained retries are
+idempotent; gaps, conflicts and retries beyond retained history fail without appending anything.
+Only a guest account can POST, while the creator is present. An account owning the creator is
+treated as host even if it also owns another profile in the session.
+
+The host polls GET `/campaign/live/proposals?session=...&epoch=...&after=...` with the last global
+sequence it consumed, initially 0. Each result has a global `seq`, `producer`, producer `number`
+and `event`. Each queue keeps the last 1,024 entries; a request or retry that reaches older entries
+fails rather than silently skipping them. A POST and a poll carry at most 64 events, POST bodies at
+most 16 KiB, and a session accepts at most 64 distinct producers per epoch. Exceeding that producer
+limit fails until a new epoch; it does not discard a producer's retry history. Host departure
+refuses new proposals, and the host returning in a new user session starts a new epoch.
+
 ## Resource limits
 
 These apply in every mode. The island upload seen from the game (`StageData`) was 2.8 MB.

@@ -10,9 +10,9 @@ Every TLS port (default 443 and 8443) serves:
     Storage semantics (the real service hands out GCS signed URLs) and downloads at
     /download/<id>. --http-port also serves storage over plain HTTP.
   * Live story co-op quest events over HTTP/1.1 or HTTP/2 at /campaign/live, client-certificate
-    mode only (CampaignLive): a game session's creator posts quest state transitions that its
-    other members poll, kept in memory with the game session (LiveJournal). Neither a starting
-    quest state nor durable stage checkpoints are served there.
+    mode only (CampaignLive): a game session's creator posts quest state transitions for its
+    members, and /campaign/live/proposals queues untrusted guest changes for the creator.
+    Both are memory-only (LiveJournal). Neither starting state nor durable checkpoints are served.
 
 A UDP STUN responder (default port 3478) is the ICE server AllocateIceServerSet hands out, so
 WebRTC peers on this PC gather candidates without reaching a public STUN server. Every datagram it
@@ -194,13 +194,15 @@ MAX_NAME_BYTES = 512  # user, document, alias, Gamesync and target names, and MI
 MAX_FIELD_DEPTH = 20  # segments of a document field path, and levels of maps one merge goes into
 STATE_OVERHEAD_BYTES = 128  # what a record adds to state.json beside its names and fields
 MAX_SESSION_PROPERTIES_BYTES = 64 * 1024  # a game session's properties; the game's were 0.4 KB
-# Live story co-op quest events (/campaign/live, CampaignLive): the state transitions of story quests
-# a game session's creator posts for its other members to poll. A game session's journal keeps the
-# last MAX_LIVE_EVENTS; one POST carries, and one poll returns, at most MAX_LIVE_BATCH, which is what
-# the game patch's inbox holds. Quest ids run from 1 to MAX_QUEST_ID, states from 1 to MAX_QUEST_STATE.
+# Live story co-op quest events and guest proposals (CampaignLive). A session keeps the last
+# MAX_LIVE_EVENTS of each, with at most MAX_LIVE_BATCH per POST or poll. The guest queue also
+# limits distinct producers per epoch; quest ids and states are restricted to the game's ranges.
 CAMPAIGN_LIVE_PATH = "/campaign/live"
+CAMPAIGN_PROPOSALS_PATH = "/campaign/live/proposals"
 MAX_LIVE_EVENTS = 1024
 MAX_LIVE_BATCH = 64
+MAX_LIVE_PRODUCERS = 64
+MAX_LIVE_SEQUENCE = (1 << 53) - 1
 MAX_LIVE_REQUEST_BYTES = 16 * 1024  # the body of one POST; MAX_LIVE_BATCH events take about 2 KB
 MAX_QUEST_ID = 1000
 MAX_QUEST_STATE = 4
@@ -1782,12 +1784,85 @@ class LiveError(Exception):
     """A refused /campaign/live request (CampaignLive): its HTTP status, an error code the client
     acts on, a message for people and, where it matters, the bounds of the journal."""
 
-    def __init__(self, status: int, code: str, message: str, journal: LiveJournal | None = None):
+    def __init__(self, status: int, code: str, message: str,
+                 journal: LiveJournal | ProposalJournal | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
         self.bounds = {"first": journal.first, "last": journal.last} if journal is not None else {}
+
+
+@dataclass(frozen=True)
+class ProposalChange:
+    """One guest's natural quest change, before the host accepts or rejects it."""
+
+    kind: str
+    id: int
+    old: int
+    new: int
+    field: str | None = None
+    site: int | None = None
+
+    def payload(self) -> dict:
+        result = {"kind": self.kind, "id": self.id, "old": self.old, "new": self.new}
+        if self.kind == "unique":
+            result.update(field=self.field, site=self.site)
+        return result
+
+
+class ProposalJournal:
+    """Bounded, session-local guest proposals. Per-producer sequence numbers make retries idempotent;
+    the host consumes a separate global sequence. A producer belongs to its authenticated account."""
+
+    def __init__(self) -> None:
+        self.events: deque[tuple[str, int, ProposalChange]] = deque()
+        self.retained: dict[tuple[str, int], ProposalChange] = {}
+        self.producers: dict[str, tuple[str, int]] = {}
+        self.last = 0
+
+    @property
+    def first(self) -> int:
+        return self.last - len(self.events) + 1
+
+    def since(self, after: int) -> list[dict]:
+        if after > self.last:
+            raise LiveError(409, "cursor_ahead", f"proposal {after} has not been posted", self)
+        if after < self.first - 1:
+            raise LiveError(409, "cursor_expired", f"proposals after {after} are no longer kept", self)
+        start = after - self.first + 1
+        return [{"seq": after + offset, "producer": producer, "number": number, "event": change.payload()}
+                for offset, (producer, number, change)
+                in enumerate(itertools.islice(self.events, start, start + MAX_LIVE_BATCH), 1)]
+
+    def append(self, account: str, producer: str, first: int, changes: list[ProposalChange]) -> int:
+        known = self.producers.get(producer)
+        if known is not None and known[0] != account:
+            raise LiveError(403, "producer_owned", "that producer belongs to another account")
+        if known is None and len(self.producers) >= MAX_LIVE_PRODUCERS:
+            raise LiveError(429, "too_many_producers", "the session has too many proposal producers")
+        last = known[1] if known is not None else 0
+        if first > last + 1:
+            raise LiveError(409, "sequence_gap", f"proposal {first} would follow producer event {last}", self)
+        overlap = min(len(changes), last - first + 1)
+        for number, change in enumerate(changes[:overlap], first):
+            kept = self.retained.get((producer, number))
+            if kept is None:
+                raise LiveError(409, "sequence_expired", f"producer event {number} is no longer kept", self)
+            if kept != change:
+                raise LiveError(409, "sequence_conflict", f"producer event {number} has other content", self)
+        additions = changes[overlap:]
+        if self.last + len(additions) > MAX_LIVE_SEQUENCE:
+            raise LiveError(409, "sequence_exhausted", "the proposal journal must start a new epoch", self)
+        for number, change in enumerate(additions, first + overlap):
+            if len(self.events) == MAX_LIVE_EVENTS:
+                old_producer, old_number, _ = self.events.popleft()
+                del self.retained[old_producer, old_number]
+            self.events.append((producer, number, change))
+            self.retained[producer, number] = change
+        self.last += len(additions)
+        self.producers[producer] = (account, max(last, first + len(changes) - 1))
+        return len(additions)
 
 
 class LiveJournal:
@@ -1803,6 +1878,7 @@ class LiveJournal:
         self.host = host  # the creator's user session when the journal started; "" if it was away
         self.events: deque[tuple[int, int, int]] = deque(maxlen=MAX_LIVE_EVENTS)
         self.last = 0  # the sequence number of the newest event; 0 before the first
+        self.proposals = ProposalJournal()
 
     @property
     def first(self) -> int:
@@ -3790,9 +3866,9 @@ class Backend:
 
 
 def is_campaign_live(target: str) -> bool:
-    """Whether an HTTP request target names /campaign/live (CampaignLive) instead of storage."""
+    """Whether an HTTP request target names a live campaign endpoint instead of storage."""
     try:
-        return urlsplit(target).path == CAMPAIGN_LIVE_PATH
+        return urlsplit(target).path in (CAMPAIGN_LIVE_PATH, CAMPAIGN_PROPOSALS_PATH)
     except ValueError:  # left to Storage.handle, as before
         return False
 
@@ -3878,6 +3954,54 @@ def parse_live_post(body: bytes) -> tuple[str, str, int, list[tuple[int, int, in
             [parse_live_event(event) for event in events])
 
 
+def parse_proposal_event(value: object) -> ProposalChange:
+    if not isinstance(value, dict):
+        raise LiveError(400, "bad_request", "a proposal event is an object")
+    if value.get("kind") == "story" and value.keys() == {"kind", "id", "old", "new"}:
+        quest, old, new = parse_live_event({key: value[key] for key in ("id", "old", "new")})
+        return ProposalChange("story", quest, old, new)
+    if value.get("kind") != "unique" or value.keys() != {"kind", "id", "old", "new", "field", "site"}:
+        raise LiveError(400, "bad_request", "a proposal event must be a story or unique quest change")
+    quest, old, new, field, site = (value[key] for key in ("id", "old", "new", "field", "site"))
+    if type(quest) is not int or not 1 <= quest <= 200:
+        raise LiveError(400, "bad_request", "a unique quest id must be from 1 to 200")
+    if (type(old) is not int or type(new) is not int or not 0 <= old <= 255
+            or not 0 <= new <= 255 or old == new):
+        raise LiveError(400, "bad_request", "unique quest bytes must be different values from 0 to 255")
+    if type(site) is not int or not 0 <= site <= 13:
+        raise LiveError(400, "bad_request", "a unique quest writer site must be from 0 to 13")
+    if site < 4:
+        if field != "state" or old > 5 or new != (2, 4, 3, 5)[site]:
+            raise LiveError(400, "bad_request", "the unique quest state does not match its writer site")
+    elif field != "counter":
+        raise LiveError(400, "bad_request", "the unique quest counter does not match its writer site")
+    return ProposalChange("unique", quest, old, new, field, site)
+
+
+def parse_proposal_post(body: bytes) -> tuple[str, str, str, int, list[ProposalChange]]:
+    if len(body) > MAX_LIVE_REQUEST_BYTES:
+        raise LiveError(413, "too_large", f"a POST's body has at most {MAX_LIVE_REQUEST_BYTES} bytes")
+    try:
+        value = json.loads(body.decode(), object_pairs_hook=unique_json_keys, parse_constant=no_json_constant)
+    except (ValueError, RecursionError) as exc:
+        raise LiveError(400, "bad_request", f"the body is not JSON: {exc}") from None
+    if not isinstance(value, dict) or value.keys() != {"session", "epoch", "producer", "first", "events"}:
+        raise LiveError(400, "bad_request", "a proposal has session, epoch, producer, first and events")
+    producer, first, events = value["producer"], value["first"], value["events"]
+    if not isinstance(producer, str) or re.fullmatch(r"[0-9a-f]{32}", producer) is None:
+        raise LiveError(400, "bad_request", "producer is a random 128-bit lowercase hexadecimal id")
+    if type(first) is not int or not 1 <= first <= MAX_LIVE_SEQUENCE:
+        raise LiveError(400, "bad_request", "first is a positive producer sequence number")
+    if not isinstance(events, list) or not events:
+        raise LiveError(400, "bad_request", "events is a list of at least one proposal")
+    if len(events) > MAX_LIVE_BATCH:
+        raise LiveError(413, "too_large", f"a POST carries at most {MAX_LIVE_BATCH} proposals")
+    if first + len(events) - 1 > MAX_LIVE_SEQUENCE:
+        raise LiveError(400, "bad_request", "producer sequence numbers are exhausted")
+    return (check_live_session(value["session"]), check_live_epoch(value["epoch"]), producer, first,
+            [parse_proposal_event(event) for event in events])
+
+
 class CampaignLive:
     """/campaign/live over HTTP/1.1 or HTTP/2: the live quest events of story co-op game sessions
     (LiveJournal). Every request is authorized by the account behind its connection, so only
@@ -3887,10 +4011,10 @@ class CampaignLive:
     in it (none or several fail) and answers its name, its journal's epoch and bounds, and the
     caller's role: "host" if the session's creator is in it and belongs to the caller's account,
     else "guest". GET ?session=&epoch=&after= also answers the events after sequence number `after`.
-    POST {session, epoch, first, events} adds events, from the creator's account only, while the
-    creator is in the session. A session without an active user of the caller's account looks
-    missing. Neither the quest state a game session starts with nor durable stage checkpoints are
-    served here: this only carries what the host posts while its guests listen."""
+    POST {session, epoch, first, events} adds host events. /campaign/live/proposals takes guest
+    quest changes and lets only the host poll them; they are proposals, not authoritative changes.
+    Both journals end with the session epoch. Starting quest state and durable checkpoints are not
+    served here."""
 
     def __init__(self, backend: Backend):
         self.backend = backend
@@ -3911,11 +4035,14 @@ class CampaignLive:
               principal: Principal | None) -> Response:
         if principal is None:
             raise LiveError(401, "unauthenticated", "live campaign events need a device certificate")
+        parts = urlsplit(target)
+        path, query = parts.path, parts.query
         if method not in ("GET", "POST"):
-            raise LiveError(405, "method_not_allowed", f"{CAMPAIGN_LIVE_PATH} takes GET and POST")
-        call = Call(CAMPAIGN_LIVE_PATH, {}, principal)
-        query = urlsplit(target).query
+            raise LiveError(405, "method_not_allowed", f"{path} takes GET and POST")
+        call = Call(path, {}, principal)
         self.backend.prune_sessions()
+        if path == CAMPAIGN_PROPOSALS_PATH:
+            return self.proposals(call, method, query, headers, body)
         if method == "GET":
             if body:
                 raise LiveError(400, "bad_request", "a GET has no body")
@@ -3939,6 +4066,32 @@ class CampaignLive:
         log.info("live quest events %d-%d posted to %s, whose journal ends at %d", first,
                  first + len(events) - 1, session.name, journal.last)
         return self.state(call, session, journal)
+
+    def proposals(self, call: Call, method: str, query: str, headers: dict[str, str], body: bytes) -> Response:
+        if method == "GET":
+            if body:
+                raise LiveError(400, "bad_request", "a GET has no body")
+            name, epoch, after = parse_live_query(query)
+            session = self.member_session(call, name)
+            if not self.hosts(call, session):
+                raise LiveError(403, "not_host", "only the session creator polls guest proposals")
+            journal = self.current(session, epoch).proposals
+            return live_response(200, {"session": session.name, "epoch": epoch, "first": journal.first,
+                                       "last": journal.last, "proposals": journal.since(after)})
+        if query:
+            raise LiveError(400, "bad_request", "a POST has no query")
+        if headers.get("content-type", "").partition(";")[0].strip().lower() != "application/json":
+            raise LiveError(415, "unsupported_media_type", "a POST's body is application/json")
+        name, epoch, producer, first, changes = parse_proposal_post(body)
+        session = self.member_session(call, name)
+        if self.hosts(call, session):
+            raise LiveError(403, "not_guest", "the creator posts authoritative events, not guest proposals")
+        if session.creator not in session.user_sessions:
+            raise LiveError(409, "host_absent", "guest proposals need the session creator present")
+        journal = self.current(session, epoch).proposals
+        added = journal.append(call.principal.account, producer, first, changes)
+        return live_response(200, {"session": session.name, "epoch": epoch, "first": journal.first,
+                                   "last": journal.last, "added": added})
 
     def member(self, call: Call, session: GameSession) -> bool:
         """Whether an active user of the caller's account is in `session` (after prune_sessions)."""
