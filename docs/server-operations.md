@@ -535,11 +535,13 @@ Without a command, the launcher runs `play`, which does this, in order, and stop
 With Python instead of the packaged launcher: `py -3 -m pip install -r requirements-launcher.txt`, then `py -3 launcher.py play --portal https://pokopia.example.org`. The other commands are `link`, `configure --user-dir <user dir>` (sets up any emulator user directory, such as `%APPDATA%\eden`, as in step 4), `run` (only the gateway) and `status`.
 
 The experimental `campaign_bridge.py` is not connected to this launcher and does not enable shared
-story progression. Its mailbox can read the patched game's unique-quest journal, stopping on lost
-entries or a foreign read cursor. An explicitly enabled guest sender posts changes the patch marks
-as local, but is not a reliable campaign feed: the story journal can misclassify or lose concurrent
-changes, deferred replay effects can appear local, and the story and unique journals do not establish
-a causal order between them. Nothing applies these proposals on the host.
+story progression. Its mailbox reads both quest journals and stops on detected loss or a foreign
+read cursor. The story journal reserves slots atomically and distinguishes the drain thread from
+other writers; its ARM64 code has been exercised in an emulator, not in a running game. An explicitly
+enabled guest sender posts changes the patch marks as local, but it is not a reliable campaign feed:
+deferred replay effects can appear local, concurrent writes do not necessarily preserve causal order,
+and the story and unique journals do not establish an order between them. Nothing applies these
+proposals on the host.
 
 In one real two-client test a guest accepted quest 11 using an additional test-only NOP at
 `main+0x114384`; that broad visitor-eligibility change is not part of the quest patch. The Windows
