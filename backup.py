@@ -19,18 +19,21 @@ out; a listed file that is missing fails the backup, and so does a damaged game 
                 database, PKI (which holds the game server's TLS key too), systemd unit and Caddy
                 configuration. Every PKI file a restore needs is required; only ingress-ca.key,
                 which may be kept offline, is optional.
+  public-stage  separate authenticated VPS deployment, including the offline ingress CA key,
+                service units, application source and dependency lock, and proxy configuration.
 
-It needs Python 3.8 or newer and only the standard library, plus ssh and rclone on PATH. To run it
-every 6 hours without a console window, enter this in cmd.exe, with PYTHONW replaced by the full
-path of the windowed interpreter (pythonw.exe) of the Python you have checked runs this script.
+This script's HOST, DESTINATION and PROFILES are specific to one deployment; adapt and review them
+before using it elsewhere. It needs Python 3.8 or newer, ssh and rclone on PATH. To run it every
+6 hours without a console window, enter this in cmd.exe after replacing PYTHONW and PROJECT_DIR.
 The interactive task only runs while this user is logged in; Windows' default power settings also
 skip starts on battery and may stop a running backup if the PC switches to battery.
-Re-create the task with --profile portal once the portal is deployed.
+Keep the private-test task and create a separate task with --profile public-stage for the
+isolated authenticated deployment.
 
-    schtasks /Create /TN "Pokopia VPS backup" /SC HOURLY /MO 6 /IT /F /TR "\"PYTHONW\" \"C:\Users\thele\Projects\pokopia-cloud-release\backup.py\" --profile private-test"
+    schtasks /Create /TN "Pokopia VPS backup" /SC HOURLY /MO 6 /IT /F /TR "\"PYTHONW\" \"PROJECT_DIR\backup.py\" --profile private-test"
 
 Results go to backup.log next to this file. To restore, copy a backup to the VPS without writing it
-to this disk, again in cmd.exe, then follow the Backups section of pokopia-cloud-release/README.md:
+to this disk, again in cmd.exe, then follow the Backups section of docs/server-operations.md:
 
     rclone cat gdrive-crypt:Pokopia-Server-Backups/<name>.tar.gz | ssh fates-vps "umask 077 && cat > /root/backup.tar.gz"
 """
@@ -54,6 +57,9 @@ from pathlib import Path
 HOST = 'fates-vps'
 SNAPSHOT = ['python3', '/opt/pokopia-server/snapshot.py', '--socket', '/run/pokopia-cloud/snapshot.sock',
             '--file', 'systemd/pokopia-cloud.service=/etc/systemd/system/pokopia-cloud.service']
+PUBLIC_SNAPSHOT = ['python3', '/opt/pokopia-public/app/snapshot.py',
+                   '--socket', '/run/pokopia-public/snapshot.sock',
+                   '--file', 'systemd/pokopia-public.service=/etc/systemd/system/pokopia-public.service']
 # What snapshot.py adds for each deployment, besides the game server's data and unit.
 PROFILES = {
     'private-test': [
@@ -70,6 +76,37 @@ PROFILES = {
         '--require', 'portal/pki/ingress.key',
         '--file', 'systemd/pokopia-portal.service=/etc/systemd/system/pokopia-portal.service',
         '--file', 'caddy/Caddyfile=/etc/caddy/Caddyfile',
+    ],
+    'public-stage': [
+        '--sqlite', 'portal/auth.db=/var/lib/pokopia-public/portal/auth.db',
+        '--dir', 'portal/pki=/var/lib/pokopia-public/portal/pki',
+        '--require', 'portal/pki/device-ca.key', '--require', 'portal/pki/device-ca.crt',
+        '--require', 'portal/pki/ingress-ca.crt', '--require', 'portal/pki/ingress.crt',
+        '--require', 'portal/pki/ingress.key',
+        '--file', 'portal/offline-ca/ingress-ca.key=/var/lib/pokopia-public/offline-ca/ingress-ca.key',
+        '--file', 'systemd/pokopia-public-portal.service=/etc/systemd/system/pokopia-public-portal.service',
+        '--file', 'systemd/pokopia-public-registration.conf=/etc/systemd/system/pokopia-public-portal.service.d/registration.conf',
+        '--file', 'systemd/pokopia-discord-proxy.service=/etc/systemd/system/pokopia-discord-proxy.service',
+        '--file', 'portal/discord-client-id=/var/lib/pokopia-public/portal/discord-client-id',
+        '--file', 'portal/discord-client-secret=/var/lib/pokopia-public/portal/discord-client-secret',
+        '--file', 'discord-proxy/tinyproxy=/opt/pokopia-discord-proxy/usr/bin/tinyproxy',
+        '--file', 'discord-proxy/tinyproxy.conf=/opt/pokopia-discord-proxy/tinyproxy.conf',
+        '--file', 'discord-proxy/allowlist=/opt/pokopia-discord-proxy/allowlist',
+        '--file', 'systemd/pokopia-public-proxy.service=/etc/systemd/system/pokopia-public-proxy.service',
+        '--file', 'systemd/pokopia-public-relay.conf=/etc/systemd/system/pokopia-public.service.d/relay.conf',
+        '--file', 'systemd/pokopia-public-ingress.socket=/etc/systemd/system/pokopia-public-ingress.socket',
+        '--file', 'systemd/pokopia-public-ingress.service=/etc/systemd/system/pokopia-public-ingress.service',
+        '--file', 'systemd/pokopia-turn.service=/etc/systemd/system/pokopia-turn.service',
+        '--file', 'relay/turn.conf=/etc/pokopia-relay/turn.conf',
+        '--file', 'relay/secret=/var/lib/pokopia-public/server/relay/secret',
+        '--file', 'caddy/Caddyfile=/opt/pokopia-proxy/Caddyfile',
+        '--file', 'application/server.py=/opt/pokopia-public/app/server.py',
+        '--file', 'application/portal.py=/opt/pokopia-public/app/portal.py',
+        '--file', 'application/snapshot.py=/opt/pokopia-public/app/snapshot.py',
+        '--file', 'application/requirements.txt=/opt/pokopia-public/app/requirements.txt',
+        '--file', 'application/requirements-portal.txt=/opt/pokopia-public/app/requirements-portal.txt',
+        '--file', 'application/requirements.lock=/opt/pokopia-public/requirements.lock',
+        '--file', 'application/SOURCE=/opt/pokopia-public/app/SOURCE',
     ],
 }
 SSH = ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15',
@@ -128,7 +165,8 @@ class Run:
 
     def upload_snapshot(self, profile: str, target: str) -> tuple[str, int, str]:
         """Streams a snapshot from the VPS into `target`: its SHA-256, size and SSH warnings."""
-        command = shlex.join([*SNAPSHOT, *PROFILES[profile]])
+        command = shlex.join([*(PUBLIC_SNAPSHOT if profile == 'public-stage' else SNAPSHOT),
+                              *PROFILES[profile]])
         with tempfile.TemporaryFile() as ssh_errors, tempfile.TemporaryFile() as rclone_errors:
             ssh = self.start([*SSH, HOST, command], stdin=subprocess.DEVNULL,
                              stdout=subprocess.PIPE, stderr=ssh_errors)

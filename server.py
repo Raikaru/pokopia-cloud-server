@@ -9,10 +9,18 @@ Every TLS port (default 443 and 8443) serves:
   * Island storage over HTTP/1.1 or HTTP/2: resumable uploads at /upload/<id> with Google Cloud
     Storage semantics (the real service hands out GCS signed URLs) and downloads at
     /download/<id>. --http-port also serves storage over plain HTTP.
+  * Live story co-op quest events over HTTP/1.1 or HTTP/2 at /campaign/live, client-certificate
+    mode only (CampaignLive): a game session's creator posts quest state transitions that its
+    other members poll, kept in memory with the game session (LiveJournal). Neither a starting
+    quest state nor durable stage checkpoints are served there.
 
 A UDP STUN responder (default port 3478) is the ICE server AllocateIceServerSet hands out, so
 WebRTC peers on this PC gather candidates without reaching a public STUN server. Every datagram it
 receives is logged with its source, and every Binding response with the address it reports.
+With --turn and --turn-secret-file it also hands out a TURN server (coturn use-auth-secret) with
+credentials that expire with the ICE server set (TurnServer). --relay-only, on top of that, passes
+every gamesync document a player reads or watches through RelayOnly, which leaves only relay
+candidates on that TURN server in session descriptions and drops what else may be signaling.
 
 Eden resolves *.npln.nintendo.net and *.npln.srv.nintendo.net to 127.0.0.1; the game dials
 <tenant>.lp1.t.npln.srv.nintendo.net:443. Every GameSession names gamesync.npln.nintendo.net and
@@ -28,8 +36,8 @@ docs/__gs/f (fixed) and docs/__gs/m (mutable) documents are created if they do n
 Every target the game registers is acknowledged with TargetChange UPDATED, which the game waits
 for, before its documents and LISTED.
 A user session is dropped once its game has had no KeepUserSession call open for
-USER_SESSION_GRACE_SECONDS, or when its user joins another game session. Its deferred writes are
-then applied, its KeepUserSession calls end and the gamesync documents named after it are deleted.
+USER_SESSION_GRACE_SECONDS, or when its user joins another game session. Its KeepUserSession calls
+end, then its deferred writes are applied and the gamesync documents named after it are deleted.
 A game session left empty is dropped with its creation tickets and all of its gamesync state.
 Message layouts follow
 https://github.com/kinnay/NPLN-Protocols (latest/proto). Methods without a handler get an empty
@@ -65,6 +73,7 @@ import contextvars
 import ctypes
 import base64
 import errno
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -83,10 +92,11 @@ import sys
 import tarfile
 import time
 import zlib
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Callable, Iterable
-from urllib.parse import quote, urlsplit
+from typing import AsyncIterator, BinaryIO, Callable, Iterable, NamedTuple
+from urllib.parse import parse_qsl, quote, urlsplit
 
 try:
     import fcntl  # POSIX: F_FULLFSYNC on macOS
@@ -105,6 +115,11 @@ log = logging.getLogger("npln")
 TOKEN_TTL_SECONDS = 28800
 KEEP_ALIVE_SECONDS = 30
 ICE_SERVER_TTL_SECONDS = 3600
+# How long the credentials AllocateIceServerSet hands out for --turn work: as long as the ICE server
+# set says it is valid. coturn refuses them for new allocations once they expire, but keeps the
+# allocations already made with them (coturn issue #1204).
+TURN_CREDENTIAL_SECONDS = ICE_SERVER_TTL_SECONDS
+MIN_TURN_SECRET_BYTES = 16
 GAMESYNC_TRANSACTION_SECONDS = 270  # unfinished gamesync transactions are dropped after this
 # A user session whose game has had no KeepUserSession call open for this long (since its last call
 # ended, or since it joined if it never opened one) is dropped, and a game session left empty with
@@ -140,6 +155,13 @@ GUESS_TRUST_SECONDS = 30 * 86400
 PASSWORD_GRANT_SECONDS = 600
 # The Ugcstore documents the game uses: tenants/<t>/documents/users/<u>/(public|private)/<name>.
 USER_DOCUMENT = re.compile(r"(tenants/[^/]+)/documents/users/([^/]+)/(public|private)/(.+)")
+# What the game commits when it saves a Cloud Island, whichever player hosts it: a visitor opens
+# the island while its owner is away, and the owner hands hosting to another player on leaving, so
+# the host saves the island to the owner's documents. A save updates these documents (by name
+# below the user) and imports its upload as the attachment of these, with the island's sessionID
+# and password as the commit's rule context.
+ISLAND_SAVE_UPDATES = frozenset({"private/StageData", "public/MetaData"})
+ISLAND_SAVE_IMPORTS = frozenset({"private/StageData"})
 
 # Resource limits, in every mode. The island's StageData upload was 2.8 MB.
 MAX_GRPC_MESSAGE_BYTES = 4 * 1024 * 1024  # one gRPC message after decompression (gRPC's default)
@@ -148,6 +170,9 @@ MAX_UPLOAD_BYTES = 32 * 1024 * 1024  # one uploaded object
 # Request data one connection holds: bodies, bidirectional calls' queued messages, parsed messages.
 MAX_CONNECTION_BUFFER_BYTES = 48 * 1024 * 1024
 MAX_BUFFERED_BYTES = 256 * 1024 * 1024  # the same across all connections
+# Parsed messages applying one Gamesync deferment may hold, outside the budgets of every
+# connection: what one connection may hold, so a deferment parses as its call could have.
+MAX_DEFERMENT_PARSE_BYTES = MAX_CONNECTION_BUFFER_BYTES
 MAX_BIDI_CALLS_PER_CONNECTION = 8  # the game opens one
 MAX_INBOUND_QUEUE_BYTES = 8 * 1024 * 1024  # decoded messages a bidirectional call has not read yet
 INBOUND_MESSAGE_OVERHEAD = 64  # queue entry and bytes-object overhead, including empty messages
@@ -164,14 +189,29 @@ DOWNLOAD_CHUNK_BYTES = 64 * 1024  # downloads are read from disk and sent in pie
 MAX_DOWNLOADS_PER_CONNECTION = 4
 MAX_DOWNLOADS = 256  # open downloads across all connections; each holds a file open
 MAX_NAME_BYTES = 512  # user, document, alias, Gamesync and target names, and MIME types
+MAX_FIELD_DEPTH = 20  # segments of a document field path, and levels of maps one merge goes into
 STATE_OVERHEAD_BYTES = 128  # what a record adds to state.json beside its names and fields
 MAX_SESSION_PROPERTIES_BYTES = 64 * 1024  # a game session's properties; the game's were 0.4 KB
+# Live story co-op quest events (/campaign/live, CampaignLive): the state transitions of story quests
+# a game session's creator posts for its other members to poll. A game session's journal keeps the
+# last MAX_LIVE_EVENTS; one POST carries, and one poll returns, at most MAX_LIVE_BATCH, which is what
+# the game patch's inbox holds. Quest ids run from 1 to MAX_QUEST_ID, states from 1 to MAX_QUEST_STATE.
+CAMPAIGN_LIVE_PATH = "/campaign/live"
+MAX_LIVE_EVENTS = 1024
+MAX_LIVE_BATCH = 64
+MAX_LIVE_REQUEST_BYTES = 16 * 1024  # the body of one POST; MAX_LIVE_BATCH events take about 2 KB
+MAX_QUEST_ID = 1000
+MAX_QUEST_STATE = 4
 # One game session's Gamesync state in memory. Documents, global values and deferred writes, names
 # included, may take MAX_GAMESYNC_BYTES in MAX_GAMESYNC_RECORDS records. Transactions and watch
 # targets have fixed caps, so with names of at most MAX_NAME_BYTES they stay within about 8 MiB
 # (transactions) and 1 MiB per KeepUserSession call (targets).
 MAX_GAMESYNC_BYTES = 16 * 1024 * 1024
 MAX_GAMESYNC_RECORDS = 4096
+# What one Gamesync commit, or the deferred writes of a user session applied together, may copy and
+# produce (GamesyncWork): twice what a game session holds, so one commit may rewrite all of it.
+MAX_GAMESYNC_COMMIT_BYTES = 2 * MAX_GAMESYNC_BYTES
+MAX_GAMESYNC_READ_BYTES = 2 * MAX_GAMESYNC_BYTES  # work and results of one Gamesync read
 MAX_GAMESYNC_TRANSACTIONS = 64
 MAX_TRANSACTION_READS = 256  # documents one transaction may read
 MAX_WATCHERS_PER_MEMBER = 4  # KeepUserSession calls open for one user session; the game opens one
@@ -284,6 +324,44 @@ STUN_ATTRIBUTE_NAMES = {
 # Session descriptions (SDP, RFC 8866) start with a version line; the game's start with "v=1".
 SDP_START = re.compile(rb"v=\d+\r?\n")
 
+# Relay-only delivery (--relay-only, RelayOnly). A gamesync value is looked into when its encoded
+# bytes hold SIGNALING_BYTES anywhere; a string or bytes value that is not a session description is
+# dropped when its text holds SIGNALING_TEXT. Session descriptions are taken apart line by line
+# (SDP_LINE) and only lines known to carry no address of the player are passed on.
+SIGNALING_BYTES = re.compile(rb"(?i)candidate|raddr|rport|IN\s+IP[46]|typ\s+(?:host|srflx|prflx|relay)|v=\d")
+SIGNALING_TEXT = re.compile(rb"(?i)candidate|\braddr\b|\brport\b|\bIN\s+IP[46]\b"
+                            rb"|\btyp\s+(?:host|srflx|prflx|relay)\b|(?:\A|\n)\W{0,8}v=\d")
+MAX_SDP_BYTES = 64 * 1024
+MAX_SDP_LINES = 256
+MAX_SIGNALING_DEPTH = 16  # levels of maps and arrays looked into, as sdp_values
+SDP_LINE = re.compile(rb"([a-z])=([\x20-\x7e]*)")
+SDP_ORIGIN = re.compile(rb"\S{1,64} ([A-Za-z0-9+/=_-]{1,64}) (\d{1,20}) IN IP[46] \S{1,64}")
+SDP_TIMING = re.compile(rb"\d{1,20} \d{1,20}")
+SDP_MEDIA = re.compile(rb"([a-z][a-z0-9-]{0,31}) (\d{1,5})(?:/\d{1,5})? "
+                       rb"([A-Za-z0-9/_-]{1,64}(?: [A-Za-z0-9_-]{1,64}){0,64})")
+SDP_BANDWIDTH = re.compile(rb"[A-Za-z-]{1,16}:\d{1,10}")
+SDP_KEPT_ATTRIBUTES = re.compile(rb"""(?x)
+    end-of-candidates | ice-lite | ice-mismatch | rtcp-mux | rtcp-rsize | extmap-allow-mixed
+    | sendrecv | sendonly | recvonly | inactive
+    | ice-(?:ufrag|pwd):[A-Za-z0-9+/]{1,256}
+    | ice-options:[A-Za-z0-9+/_-]{1,64}(?:\ [A-Za-z0-9+/_-]{1,64}){0,8}
+    | setup:(?:actpass|active|passive|holdconn)
+    | fingerprint:[A-Za-z0-9-]{1,16}\ (?:[0-9A-Fa-f]{2}:){15,63}[0-9A-Fa-f]{2}
+    | mid:[A-Za-z0-9_-]{1,32}
+    | group:[A-Za-z0-9_-]{1,32}(?:\ [A-Za-z0-9_-]{1,32}){0,32}
+    | sctp-port:\d{1,5} | max-message-size:\d{1,20}
+    | tls-id:[A-Za-z0-9+/=_-]{1,255}
+""")
+SDP_CANDIDATE = re.compile(rb"candidate:([A-Za-z0-9+/]{1,32}) (\d{1,3}) ([A-Za-z]{1,16}) (\d{1,10}) (\S{1,64}) "
+                           rb"(\d{1,5}) typ ([a-z]{1,16})((?: \S{1,64} \S{1,256}){0,16})")
+# Candidate extensions passed on, with their values; raddr and rport are replaced, others dropped.
+SDP_CANDIDATE_EXTENSIONS = {
+    b"generation": re.compile(rb"\d{1,10}"),
+    b"network-id": re.compile(rb"\d{1,10}"),
+    b"network-cost": re.compile(rb"\d{1,10}"),
+    b"ufrag": re.compile(rb"[A-Za-z0-9+/]{1,256}"),
+}
+
 # Island addresses use this alphabet in the game (e.g. "JW7MXKP2").
 ALIAS_ALPHABET = "0123456789BCDFGHJKLMNPQRSTVWXY"
 ALIAS_LENGTH = 8
@@ -348,11 +426,29 @@ def encode(*fields: tuple[int, object]) -> bytes:
     return bytes(out)
 
 
-# The connection (H2Session) whose call the current task is handling, set by Server.handle_grpc
-# and inherited by tasks the handler starts. Messages parsed meanwhile count against its request
-# budgets (Msg). None elsewhere: at startup, in tests, in background tasks and while deferred
-# Gamesync writes are applied (Backend.gamesync_fire_deferments).
-request_budget: contextvars.ContextVar[H2Session | None] = contextvars.ContextVar("request_budget", default=None)
+# The request budgets the current task's parsed messages count against (Msg): the connection
+# (H2Session) whose call it is handling, set by Server.handle_grpc and inherited by tasks the
+# handler starts, or a ParseBudget of its own while a deferred Gamesync write is applied
+# (Backend.gamesync_apply_queued). None elsewhere: at startup, in tests and in background tasks.
+request_budget: contextvars.ContextVar[H2Session | ParseBudget | None] = contextvars.ContextVar(
+    "request_budget", default=None)
+
+
+class ParseBudget:
+    """Request budgets (request_budget) for messages parsed outside any call: they may hold `size`
+    bytes (message_cost) at once, whatever the connections hold, and count against nothing else."""
+
+    def __init__(self, size: int) -> None:
+        self.left = size
+
+    def request_room(self) -> int:
+        return self.left
+
+    def count(self, size: int) -> None:
+        self.left -= size
+
+    def uncount(self, size: int) -> None:
+        self.left += size
 
 
 def message_cost(size: int, fields: int) -> int:
@@ -364,8 +460,8 @@ class Msg:
     """A message decoded without its schema: field number -> (wire type, value) in wire order.
 
     A message holds Python objects for each field, many times the bytes it came from, so one
-    parsed while a call is handled (request_budget) counts message_cost against the connection's
-    request budgets from the moment it is parsed until the last reference to it goes (__del__):
+    parsed while request budgets apply (request_budget) counts message_cost against them from
+    the moment it is parsed until the last reference to it goes (__del__):
     while a handler, a paused generator or a nested call still holds it, and no longer once a
     cancelled or finished call has dropped it. A message that would not fit is refused while it
     is parsed, with RESOURCE_EXHAUSTED, and one of more than MAX_MESSAGE_FIELDS fields is
@@ -373,7 +469,7 @@ class Msg:
 
     def __init__(self, buf: bytes = b""):
         self.fields: dict[int, list[tuple[int, int | bytes]]] = {}
-        self.budget: H2Session | None = None  # what this message counts against, once parsed
+        self.budget: H2Session | ParseBudget | None = None  # what this message counts against, once parsed
         self.cost = 0
         budget = request_budget.get() if buf else None
         fitting = MAX_MESSAGE_FIELDS  # fields that fit the budget
@@ -548,7 +644,8 @@ def encode_map(entries: dict[str, bytes]) -> bytes:
 
 
 def split_field_path(path: str) -> list[str]:
-    """Splits a dotted field path, honoring `quoted` segments."""
+    """Splits a dotted field path, honoring `quoted` segments. A path may have at most
+    MAX_FIELD_DEPTH segments: its field is read and set one level at a time (set_field)."""
     parts: list[str] = []
     current = ""
     quoted = False
@@ -567,41 +664,68 @@ def split_field_path(path: str) -> list[str]:
             current += char
         i += 1
     parts.append(current)
+    if len(parts) > MAX_FIELD_DEPTH:
+        raise GrpcError(INVALID_ARGUMENT, f"a field path has more than {MAX_FIELD_DEPTH} segments")
     return parts
 
 
-def get_field(entries: dict[str, bytes], parts: list[str]) -> bytes | None:
+def get_field(entries: dict[str, bytes], parts: list[str], work: GamesyncWork | None = None) -> bytes | None:
+    """The field `parts` (split_field_path) of `entries`, or None. Every map above it is decoded;
+    each costs `work` (Gamesync commits) its size before it is."""
     value = entries.get(parts[0])
     if len(parts) == 1 or value is None:
         return value
+    if work is not None:
+        work.spend(len(value))
     nested = Msg(value).get_bytes(10)  # Value.map_value
-    return None if nested is None else get_field(map_entries(nested), parts[1:])
+    return None if nested is None else get_field(map_entries(nested), parts[1:], work)
 
 
-def set_field(entries: dict[str, bytes], parts: list[str], value: bytes | None) -> dict[str, bytes]:
-    """Returns a copy of `entries` with the field set, or deleted when `value` is None."""
-    entries = dict(entries)
+def set_field(entries: dict[str, bytes], parts: list[str], value: bytes | None,
+              work: GamesyncWork | None = None) -> bool:
+    """Sets the field in `entries`, or deletes it when `value` is None, and returns whether
+    `entries` changed. Setting a nested field makes every field above it a map, replacing whatever
+    else it held; deleting one changes nothing unless every field above it is a map and it is
+    there. A nested field's maps are decoded and encoded again, from its own up to the one at the
+    top of `entries`; each costs `work` (Gamesync commits), before it is decoded, its size twice and
+    `value`."""
     if len(parts) == 1:
-        if value is None:
-            entries.pop(parts[0], None)
-        else:
+        if value is not None:
             entries[parts[0]] = value
-        return entries
+            return True
+        return entries.pop(parts[0], None) is not None
     current = entries.get(parts[0])
-    nested = map_entries(Msg(current).get_bytes(10)) if current is not None else {}
-    entries[parts[0]] = encode((10, encode_map(set_field(nested, parts[1:], value))))
-    return entries
+    if current is None and value is None:
+        return False
+    if work is not None:
+        work.spend(2 * len(current or b"") + len(value or b""))
+    inner = Msg(current).get_bytes(10) if current is not None else None  # Value.map_value
+    if inner is None and value is None:
+        return False  # the field above it holds no map, so it is not there to delete
+    nested = map_entries(inner)
+    if not set_field(nested, parts[1:], value, work):
+        return False
+    entries[parts[0]] = encode((10, encode_map(nested)))
+    return True
 
 
-def merge_entries(entries: dict[str, bytes], incoming: dict[str, bytes]) -> dict[str, bytes]:
-    """Merges `incoming` into `entries`, recursing into fields that are maps on both sides."""
+def merge_entries(entries: dict[str, bytes], incoming: dict[str, bytes], work: GamesyncWork,
+                  depth: int = 1) -> dict[str, bytes]:
+    """Merges `incoming` into `entries`, recursing into fields that are maps on both sides, at most
+    MAX_FIELD_DEPTH levels deep. Each map `incoming` holds for a field `entries` also has costs
+    `work` both their sizes twice before either is decoded: both are decoded, and their merged map
+    is encoded again."""
     merged = dict(entries)
     for key, value in incoming.items():
         current = merged.get(key)
         nested = Msg(value).get_bytes(10)  # Value.map_value
-        current_nested = Msg(current).get_bytes(10) if current is not None else None
-        if nested is not None and current_nested is not None:
-            value = encode((10, encode_map(merge_entries(map_entries(current_nested), map_entries(nested)))))
+        if nested is not None and current is not None:
+            work.spend(2 * (len(current) + len(value)))
+            if (current_nested := Msg(current).get_bytes(10)) is not None:
+                if depth >= MAX_FIELD_DEPTH:
+                    raise GrpcError(INVALID_ARGUMENT, f"a merge goes more than {MAX_FIELD_DEPTH} maps deep")
+                inner = merge_entries(map_entries(current_nested), map_entries(nested), work, depth + 1)
+                value = encode((10, encode_map(inner)))
         merged[key] = value
     return merged
 
@@ -619,11 +743,12 @@ def _number(value: bytes | None) -> int | float | None:
     return None
 
 
-def apply_transform(entries: dict[str, bytes], path: str, kind: str, operand: bytes | None,
-                    now: int) -> tuple[dict[str, bytes], bytes]:
-    """Applies a ugcstore FieldTransform and returns the new entries and the resulting Value."""
-    parts = split_field_path(path)
-    current = get_field(entries, parts)
+def apply_transform(entries: dict[str, bytes], parts: list[str], kind: str, operand: bytes | None,
+                    now: int, work: GamesyncWork | None = None) -> bytes:
+    """Applies a ugcstore FieldTransform to field `parts` (split_field_path) of `entries` and
+    returns the resulting Value. Reading and setting a nested field costs `work` (Gamesync commits)
+    the maps it decodes and encodes again (get_field, set_field)."""
+    current = get_field(entries, parts, work)
     if kind == "request_time":
         result = encode((6, timestamp(now)))
     else:
@@ -637,29 +762,35 @@ def apply_transform(entries: dict[str, bytes], path: str, kind: str, operand: by
             result = current if a >= b else operand
         else:
             result = current if a <= b else operand
-    return set_field(entries, parts, result), result
+    set_field(entries, parts, result, work)
+    return result
 
 
-def gamesync_transform(entries: dict[str, bytes], transform: Msg, globals_: dict[str, bytes],
-                       now: int) -> tuple[dict[str, bytes], bytes]:
-    """Applies a gamesync FieldTransform and returns the new entries and the resulting Value."""
+def gamesync_transform(entries: dict[str, bytes], transform: Msg, globals_: dict[str, bytes], now: int,
+                       work: GamesyncWork) -> bytes:
+    """Applies a gamesync FieldTransform to `entries` and returns the resulting Value. It costs
+    `work` that Value, which its WriteResult copies, and for a nested field the maps it decodes and
+    encodes again, each before it does (get_field, set_field)."""
     path = transform.get_str(1)
-    if transform.has(2):  # set_server_value: REQUEST_TIME
-        return apply_transform(entries, path, "request_time", None, now)
-    for number, kind in ((3, "increment"), (4, "maximum"), (5, "minimum")):
-        if transform.has(number):
-            return apply_transform(entries, path, kind, transform.get_bytes(number), now)
     parts = split_field_path(path)
-    if transform.has(6):  # load_global_value: copies a global value into the field
-        value = globals_.get(transform.get_str(6), NULL_VALUE)
-        return set_field(entries, parts, value), value
-    if transform.has(7):  # store_global_value: copies the field into a global value
-        value = get_field(entries, parts) or NULL_VALUE
-        globals_[transform.get_str(7)] = value
-        return entries, value
-    if transform.has(8):  # clear_global_value
-        return entries, globals_.pop(transform.get_str(8), NULL_VALUE)
-    raise GrpcError(INVALID_ARGUMENT, f"empty transform for {path}")
+    kinds = {3: "increment", 4: "maximum", 5: "minimum"}
+    number = next((n for n in kinds if transform.has(n)), None)
+    if transform.has(2):  # set_server_value: REQUEST_TIME
+        result = apply_transform(entries, parts, "request_time", None, now, work)
+    elif number is not None:
+        result = apply_transform(entries, parts, kinds[number], transform.get_bytes(number), now, work)
+    elif transform.has(6):  # load_global_value: copies a global value into the field
+        result = globals_.get(transform.get_str(6), NULL_VALUE)
+        set_field(entries, parts, result, work)
+    elif transform.has(7):  # store_global_value: copies the field into a global value
+        result = get_field(entries, parts, work) or NULL_VALUE
+        globals_[transform.get_str(7)] = result
+    elif transform.has(8):  # clear_global_value
+        result = globals_.pop(transform.get_str(8), NULL_VALUE)
+    else:
+        raise GrpcError(INVALID_ARGUMENT, f"empty transform for {path}")
+    work.spend(len(result))
+    return result
 
 
 # --- Tokens and ids ---------------------------------------------------------------------------
@@ -1066,8 +1197,25 @@ class Store:
         return state, blobs, damaged
 
 
-def doc_entries(doc: dict | None) -> dict[str, bytes]:
-    return map_entries(base64.b64decode(doc["fields"])) if doc else {}
+def doc_entries(doc: dict | None, work: GamesyncWork | None = None) -> dict[str, bytes]:
+    """The fields of a stored document. Decoding them costs `work` (Gamesync commits) their size
+    first."""
+    if not doc:
+        return {}
+    if work is not None:
+        work.spend(len(doc["fields"]))
+    return map_entries(base64.b64decode(doc["fields"]))
+
+
+def stored_fields_size(entries: dict[str, bytes]) -> int:
+    """The size of the "fields" updated_document stores for `entries`, worked out without encoding
+    them."""
+    size = 0
+    for key, value in entries.items():
+        key_size = len(key.encode())
+        entry = 2 + len(_varint(key_size)) + key_size + len(_varint(len(value))) + len(value)
+        size += 1 + len(_varint(entry)) + entry
+    return 4 * ((size + 2) // 3)  # base64
 
 
 _KEEP = object()
@@ -1084,39 +1232,58 @@ def updated_document(doc: dict | None, now: int, entries: dict[str, bytes] | Non
     return result
 
 
-def masked_entries(doc: dict | None, incoming: dict[str, bytes], mask: Msg | None) -> dict[str, bytes]:
+def masked_entries(doc: dict | None, incoming: dict[str, bytes], mask: Msg | None,
+                   work: GamesyncWork | None = None) -> dict[str, bytes]:
     """The fields after an update: `incoming` replaces all of them, or only the masked paths.
 
-    A missing or empty mask, or one holding the `*` wildcard, replaces every field.
+    A missing or empty mask, or one holding the `*` wildcard, replaces every field. A masked path
+    `incoming` lacks is deleted, if it is there (set_field). Decoding `doc` for a mask costs `work`
+    (Gamesync commits) its fields (doc_entries), and a nested path the maps it decodes on both sides
+    and encodes again, each before it does (get_field, set_field).
     """
     if mask is None:
         return incoming
     paths = mask.get_strs(1)
     if not paths or "*" in paths:
         return incoming
-    entries = doc_entries(doc)
+    entries = doc_entries(doc, work)
     for path in paths:
         parts = split_field_path(path)
-        entries = set_field(entries, parts, get_field(incoming, parts))
+        set_field(entries, parts, get_field(incoming, parts, work), work)
     return entries
 
 
-def encode_document(name: str, doc: dict, mask: Msg | None = None) -> bytes:
-    """Encodes a Document; a read mask (FieldMask) limits it to the listed field paths.
+def read_mask_paths(mask: Msg | None) -> list[str]:
+    """Decode one read mask once, including for multi-document requests."""
+    paths = mask.get_strs(1) if mask is not None else []
+    return [] if "*" in paths else paths
+
+
+def encode_document(name: str, doc: dict, paths: list[str] | None = None,
+                    work: GamesyncReadWork | None = None, relay: RelayOnly | None = None) -> bytes:
+    """Encodes a Document; a read mask (FieldMask) limits it to the listed field paths, and
+    relay-only delivery (RelayOnly.fields) to what may reach a player.
 
     An empty mask, or one holding the `*` wildcard, returns every field.
     """
+    if work is not None:
+        work.spend(len(doc["fields"]) + len(name) + STATE_OVERHEAD_BYTES)
     fields = base64.b64decode(doc["fields"])
-    paths = mask.get_strs(1) if mask is not None else []
-    if paths and "*" not in paths:
+    if paths:
         entries = map_entries(fields)
         masked: dict[str, bytes] = {}
         for path in paths:
             parts = split_field_path(path)
+            if work is not None:
+                work.spend(STATE_OVERHEAD_BYTES + len(path) +
+                           len(parts) * (len(entries.get(parts[0]) or b"") +
+                                         len(masked.get(parts[0]) or b"")))
             value = get_field(entries, parts)
             if value is not None:
-                masked = set_field(masked, parts, value)
+                set_field(masked, parts, value)
         fields = encode_map(masked)
+    if relay is not None:
+        fields = relay.fields(fields)
     return encode(
         (1, name),
         (2, fields),
@@ -1141,11 +1308,15 @@ def check_precondition(name: str, doc: dict | None, precondition: Msg | None) ->
 class Staging:
     """Uncommitted document changes of one commit."""
 
-    def __init__(self, documents: dict[str, dict]):
+    def __init__(self, documents: dict[str, dict], rule_context: bytes | None = None):
         self.documents = documents
+        self.rule_context = rule_context  # the commit's; a Cloud Island save sends sessionID and password
         self.changes: dict[str, dict | None] = {}
         self.imported_uploads: list[str] = []
         self.new_blobs: list[str] = []
+        # owner -> whether this commit may save that owner's Cloud Island (Backend.check_write_access),
+        # decided once per commit so that a wrong password counts once
+        self.island_saves: dict[str, bool] = {}
 
     def get(self, name: str) -> dict | None:
         return self.changes[name] if name in self.changes else self.documents.get(name)
@@ -1209,6 +1380,7 @@ class Storage:
         self.store = store
         self.base_url = base_url
         self.max_bytes = DEFAULT_MAX_STORAGE_BYTES  # every document, attachment and upload together
+        self.stage_download_allowed: Callable[[Principal, str], bool] | None = None
 
     def usage(self, account: str | None = None) -> tuple[int, int]:
         """(state bytes, blob bytes) of `account`, or of everyone when it is None. State bytes are
@@ -1285,9 +1457,7 @@ class Storage:
 
     def handle(self, method: str, target: str, headers: dict[str, str], body: bytes,
                principal: Principal | None = None) -> Response:
-        """Serves one storage request. In client-certificate mode `principal` is the account behind
-        the connection: only the account that asked for an upload URI may use it, and attachments
-        only download for the account that owns their document (see may_download)."""
+        """Serves storage requests with account checks, including island attachment grants."""
         parts = urlsplit(target).path.strip("/").split("/")
         if len(parts) == 2 and ID_PATTERN.fullmatch(parts[1]):
             kind, resource = parts
@@ -1405,8 +1575,8 @@ class Storage:
                         [("x-goog-stored-content-length", str(size)), ("etag", f'"{upload_id}"')])
 
     def may_download(self, blob_id: str, principal: Principal | None) -> bool:
-        """Whether `principal` may download a blob: always in local mode; in client-certificate
-        mode only its own upload sessions and the attachments of documents its users own."""
+        """Allow owned blobs and StageData attachments another account may read
+        (Backend.stage_attachment_allowed)."""
         if principal is None:
             return True
         upload = self.store.uploads.get(blob_id)
@@ -1414,8 +1584,11 @@ class Storage:
             return upload.get("owner") == principal.account
         for name, doc in self.store.documents.items():
             if (doc.get("attachment") or {}).get("blob") == blob_id:
-                user = self.store.users.get(document_owner(name) or "")
-                return user is not None and user.get("owner") == principal.account
+                owner = self.store.users.get(document_owner(name) or "")
+                if owner is not None and owner.get("owner") == principal.account:
+                    return True
+                if self.stage_download_allowed is not None and self.stage_download_allowed(principal, name):
+                    return True
         return False
 
     def download(self, blob_id: str, headers: dict[str, str], principal: Principal | None = None) -> Response:
@@ -1458,6 +1631,30 @@ class Call:
     network: str = ""  # the caller's network (network_of) for rate limits
 
 
+class Aliases(NamedTuple):
+    """What the aliases in a call's names stand for (Backend.aliases): "tenants/current" for its
+    npln-tenant-id metadata, "userSessions/current" for the user session its gamesync token was
+    issued for and "users/current" for the user its access token, or else its gamesync token, was
+    issued to. An alias with nothing to stand for (empty) stays as it is."""
+
+    tenant_id: str = ""
+    user_session: str = ""
+    user_id: str = ""
+
+    def expand(self, name: str) -> str:
+        if self.tenant_id and (name == "tenants/current" or name.startswith("tenants/current/")):
+            name = f"tenants/{self.tenant_id}{name[len('tenants/current'):]}"
+        if self.user_session and (name == "userSessions/current" or name.startswith("userSessions/current/")):
+            name = f"{self.user_session}{name[len('userSessions/current'):]}"
+        if not self.user_id or "users/current" not in name:
+            return name
+        segments = name.split("/")
+        for i in range(len(segments) - 1):
+            if segments[i] == "users" and segments[i + 1] == "current":
+                segments[i + 1] = self.user_id
+        return "/".join(segments)
+
+
 def paginate(names: list[str], page_size: int, page_token: str) -> tuple[list[str], str]:
     """Pages sorted names; a page token is the last name of the previous page."""
     if page_token:
@@ -1474,6 +1671,8 @@ class UserSession:
     definition: bytes  # the UserDefinition the user joined with
     create_time: int
     last_seen: int  # when it joined, then when its last KeepUserSession call ended
+    # password_version of the password of the island its game session hosts when the user joined
+    island_password_version: str = ""
 
     def encode(self) -> bytes:
         definition = Msg(self.definition)
@@ -1488,6 +1687,22 @@ class UserSession:
         )
 
 
+class QueuedDeferment(NamedTuple):
+    """A deferment taken from GamesyncSpace.deferments to be applied (Backend.gamesync_fire_deferments)."""
+
+    name: str
+    owner: str  # the user session that stored it
+    aliases: Aliases  # what the aliases in its names stood for when it was stored
+    deferment: bytes  # the Deferment message as received
+
+
+class QueuedDeparture(NamedTuple):
+    """User session `user_session` left: the Gamesync documents named after it are to be deleted,
+    once the deferments queued before are applied (Backend.gamesync_fire_deferments)."""
+
+    user_session: str
+
+
 class GamesyncSpace:
     """The gamesync state of one game session. The game names documents without their game session
     (docs/__gs/f, docs/__us/<user session id>, ...), so each game session keeps its own documents,
@@ -1498,33 +1713,129 @@ class GamesyncSpace:
         self.globals: dict[str, bytes] = {}
         # transaction -> (begin time, update_time of every document read in it; None if missing)
         self.transactions: dict[bytes, tuple[float, dict[str, int | None]]] = {}
-        # deferment name -> (owning user session, what resolves its names (deferment_call), the
-        # Deferment message as received, whose field 2 holds its WriteOperations). It stays encoded
-        # until it is applied, so it holds the bytes it counts (gamesync_size) and no list per write.
-        self.deferments: dict[str, tuple[str, Call, bytes]] = {}
+        # deferment name -> (owning user session, what the aliases in its names stood for when it
+        # was stored, the Deferment message as received, whose field 2 holds its WriteOperations).
+        # It stays encoded until it is applied, so it holds the bytes it counts (gamesync_size) and
+        # no list per write.
+        self.deferments: dict[str, tuple[str, Aliases, bytes]] = {}
         self.watchers: set[GamesyncWatcher] = set()
         self.sequence = itertools.count(1)  # ussid and ucsid of docs/__us documents
+        # What KeepUserSession calls that ended and user sessions that left still have to do here,
+        # in order (Backend.gamesync_fire_deferments): apply deferments taken from `deferments`,
+        # which count against the Gamesync limit until then (gamesync_size), and delete the
+        # documents of a user session that left after its deferments. A task of the game session
+        # (`applier`) works through it one entry per turn of the event loop.
+        self.queue: deque[QueuedDeferment | QueuedDeparture] = deque()
+        self.applier: asyncio.Task | None = None
 
 
-def deferment_call(call: Call) -> Call:
-    """What a deferment keeps of the call that stored it: the metadata and account Backend.resolve
-    reads, so its writes resolve their names as that call would, without holding the rest of the
-    call's headers for as long as it waits."""
-    metadata = {key: call.metadata[key] for key in ("npln-tenant-id", "authorization") if key in call.metadata}
-    return Call("", metadata, call.principal)
+class GamesyncWork:
+    """What a Gamesync commit, a deferment applied on its own included
+    (Backend.gamesync_apply_queued), may still copy and produce (MAX_GAMESYNC_COMMIT_BYTES). Every
+    write costs STATE_OVERHEAD_BYTES and its document as staged; field transforms, masked paths and
+    merges add the values and nested maps they copy, each before they copy them (gamesync_transform,
+    masked_entries, merge_entries). A commit holds its WriteResults until it is over and applies
+    its writes without yielding, so this bounds the memory it takes and how long other calls wait
+    for it. Past it the commit fails with RESOURCE_EXHAUSTED and changes nothing."""
+
+    def __init__(self) -> None:
+        self.left = MAX_GAMESYNC_COMMIT_BYTES
+
+    def spend(self, size: int) -> None:
+        self.left -= size
+        if self.left < 0:
+            raise GrpcError(RESOURCE_EXHAUSTED, "the gamesync writes copy too much data")
+
+
+class GamesyncReadWork:
+    """Bounds copied data and nested mask work across one Gamesync read response."""
+
+    def __init__(self) -> None:
+        self.left = MAX_GAMESYNC_READ_BYTES
+
+    def spend(self, size: int) -> None:
+        self.left -= size
+        if self.left < 0:
+            raise GrpcError(RESOURCE_EXHAUSTED, "the gamesync read copies too much data")
 
 
 def gamesync_size(docs: dict[str, dict | None], globals_: dict[str, bytes],
-                  deferments: dict[str, tuple[str, Call, bytes]]) -> tuple[int, int]:
+                  deferments: dict[str, tuple[str, Aliases, bytes]],
+                  queued: Iterable[QueuedDeferment | QueuedDeparture] = ()) -> tuple[int, int]:
     """(bytes, records) of a game session's Gamesync documents, global values and deferred writes,
-    names and per-record overhead included; documents staged as deleted (None) do not count. A
-    deferment counts its encoded Deferment message, field keys and lengths included, so an empty
-    write still costs what it holds, and the metadata it keeps (deferment_call)."""
+    stored or `queued` to be applied (GamesyncSpace.queue), names and per-record overhead included;
+    documents staged as deleted (None) do not count. A deferment counts its encoded Deferment
+    message, field keys and lengths included, so an empty write still costs what it holds, and the
+    aliases it keeps."""
+    held = [(name, aliases, deferment) for name, (_, aliases, deferment) in deferments.items()]
+    held += [(entry.name, entry.aliases, entry.deferment) for entry in queued if isinstance(entry, QueuedDeferment)]
     size = sum(len(name) + len(doc["fields"]) + STATE_OVERHEAD_BYTES for name, doc in docs.items() if doc is not None)
     size += sum(len(key) + len(value) + STATE_OVERHEAD_BYTES for key, value in globals_.items())
-    size += sum(len(name) + len(deferment) + sum(map(len, call.metadata.values())) + STATE_OVERHEAD_BYTES
-                for name, (_, call, deferment) in deferments.items())
-    return size, sum(1 for doc in docs.values() if doc is not None) + len(globals_) + len(deferments)
+    size += sum(len(name) + len(deferment) + sum(map(len, aliases)) + STATE_OVERHEAD_BYTES
+                for name, aliases, deferment in held)
+    return size, sum(1 for doc in docs.values() if doc is not None) + len(globals_) + len(held)
+
+
+class LiveError(Exception):
+    """A refused /campaign/live request (CampaignLive): its HTTP status, an error code the client
+    acts on, a message for people and, where it matters, the bounds of the journal."""
+
+    def __init__(self, status: int, code: str, message: str, journal: LiveJournal | None = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.bounds = {"first": journal.first, "last": journal.last} if journal is not None else {}
+
+
+class LiveJournal:
+    """The live quest events of one game session: (quest id, old state, new state) transitions its
+    creator's game posted, numbered from 1 in posting order. It keeps the newest MAX_LIVE_EVENTS, and
+    a cursor or resend that reaches past them fails instead of skipping what was discarded. It lives
+    and ends with its game session, in memory only. Its epoch names it: when the creator plays in the
+    game session under another user session, its game started over and a new journal, with a new
+    epoch, replaces this one (CampaignLive.journal)."""
+
+    def __init__(self, host: str):
+        self.epoch = random_id()
+        self.host = host  # the creator's user session when the journal started; "" if it was away
+        self.events: deque[tuple[int, int, int]] = deque(maxlen=MAX_LIVE_EVENTS)
+        self.last = 0  # the sequence number of the newest event; 0 before the first
+
+    @property
+    def first(self) -> int:
+        """The sequence number of the oldest event kept; last + 1 while there is none."""
+        return self.last - len(self.events) + 1
+
+    def since(self, after: int) -> list[dict[str, int]]:
+        """The events after sequence number `after`, in order, at most MAX_LIVE_BATCH of them."""
+        if after > self.last:
+            raise LiveError(409, "cursor_ahead", f"event {after} has not been posted", self)
+        if after < self.first - 1:
+            raise LiveError(409, "cursor_expired", f"the events after {after} are no longer kept", self)
+        start = after - self.first + 1
+        return [{"seq": after + offset, "id": quest, "old": old, "new": new}
+                for offset, (quest, old, new)
+                in enumerate(itertools.islice(self.events, start, start + MAX_LIVE_BATCH), 1)]
+
+    def append(self, first: int, events: list[tuple[int, int, int]]) -> None:
+        """Takes `events` as sequence numbers first, first + 1, ... (first >= 1). A resend of events
+        already taken must match them, and then only what follows them is added; a refused batch
+        adds nothing."""
+        if first > self.last + 1:
+            raise LiveError(409, "sequence_gap", f"event {first} would follow event {self.last}", self)
+        overlap = min(len(events), self.last - first + 1)  # events already taken
+        if overlap > 0:
+            if first < self.first:
+                raise LiveError(409, "sequence_expired",
+                                f"event {first} is no longer kept, so its resend cannot be checked", self)
+            start = first - self.first
+            taken = itertools.islice(self.events, start, start + overlap)
+            for seq, (kept, sent) in enumerate(zip(taken, events), first):
+                if kept != sent:
+                    raise LiveError(409, "sequence_conflict", f"event {seq} was posted with other content", self)
+        self.events.extend(events[overlap:])
+        self.last += len(events) - overlap
 
 
 @dataclass
@@ -1536,9 +1847,13 @@ class GameSession:
     port: int
     password: str = ""
     properties_raw: bytes | None = None  # encoded MapValue, passed through as the client sent it
-    creator: str = ""  # the user who created it: the island's owner, who hosts it
+    creator: str = ""  # the user who created it
+    # The user whose Cloud Island it hosts (Backend.hosted_island), which a visitor may host while
+    # the owner is away; "" if none is known, and then the creator is taken to be the island's owner.
+    island: str = ""
     user_sessions: dict[str, UserSession] = field(default_factory=dict)  # by user name
     gamesync: GamesyncSpace = field(default_factory=GamesyncSpace, repr=False, compare=False)
+    live: LiveJournal | None = field(default=None, repr=False, compare=False)  # CampaignLive.journal
 
     def encode(self, reveal_password: bool = True) -> bytes:
         """The GameSession message. In client-certificate mode only members see the password
@@ -1675,20 +1990,281 @@ def describe_sdp(data: bytes) -> str:
     return f"{len(data)} bytes, sha256 {hashlib.sha256(data).hexdigest()[:16]}"
 
 
-def log_gamesync_sdp(changes: dict[str, dict | None], writer: str) -> None:
+@dataclass(frozen=True)
+class TurnServer:
+    """A TURN server that shares a secret with this one (--turn, --turn-secret-file; coturn
+    use-auth-secret with the same static-auth-secret). AllocateIceServerSet hands it out with
+    credentials of the TURN REST API scheme coturn checks: username "<expiry>:<user>", where
+    <expiry> is a Unix time TURN_CREDENTIAL_SECONDS ahead, and password
+    base64(HMAC-SHA1(secret, username))."""
+
+    host: str
+    port: int
+    secret: bytes = field(repr=False)
+
+    def credentials(self, user: str, now: int) -> tuple[str, str]:
+        """Username and password for `user` at Unix time `now`."""
+        username = f"{now + TURN_CREDENTIAL_SECONDS}:{user}"
+        digest = hmac.new(self.secret, username.encode(), hashlib.sha1).digest()
+        return username, base64.b64encode(digest).decode()
+
+
+def _only_field(data: bytes, number: int) -> list[bytes] | None:
+    """The occurrences of length-delimited field `number` in a message that holds nothing else, or
+    None for one that does not parse or holds anything else."""
+    try:
+        msg = Msg(data)
+    except ValueError:
+        return None
+    if msg.fields.keys() - {number} or any(wire != 2 for wire, _ in msg.fields.get(number, ())):
+        return None
+    return [item for _, item in msg.fields.get(number, ())]
+
+
+def _map_items(data: bytes) -> list[tuple[bytes, bytes]] | None:
+    """The (key, encoded Value) entries of a MapValue in wire order, or None unless every entry
+    holds at most one key and one value and no key is repeated: a peer's parser would merge or
+    pick among those, so what it sees could differ from what was looked at."""
+    entries = _only_field(data, 1)
+    if entries is None:
+        return None
+    items: list[tuple[bytes, bytes]] = []
+    keys: set[bytes] = set()
+    for entry in entries:
+        try:
+            msg = Msg(entry)
+        except ValueError:
+            return None
+        if msg.fields.keys() - {1, 2} or any(len(values) != 1 or values[0][0] != 2
+                                             for values in msg.fields.values()):
+            return None
+        key = msg.get_bytes(1) or b""
+        if key in keys:
+            return None
+        keys.add(key)
+        items.append((key, msg.get_bytes(2) or b""))
+    return items
+
+
+@dataclass(frozen=True)
+class RelayOnly:
+    """Relay-only delivery (--relay-only): what of a gamesync document reaches a player, so that
+    the session descriptions players exchange offer only candidates on the TURN server's relay
+    (`address`, the --turn IPv4 address, and `ports`, --turn-relay-ports) and no address of a
+    player's own. Every gamesync read, watch and change notification, and every field transform
+    result, passes through it; what is stored is not changed.
+
+    A session description (a string or bytes value starting with a version line, SDP_START) is
+    rebuilt line by line (sdp). A value that may be signaling otherwise is dropped: a string or
+    bytes value whose text holds SIGNALING_TEXT, a value nested deeper than MAX_SIGNALING_DEPTH,
+    and a value holding signaling that is not exactly one field, an array or a map a peer's parser
+    would read the same way (_only_field, _map_items). A dropped value becomes null, so maps keep
+    their keys and arrays their indexes. Values without SIGNALING_BYTES are passed on as stored.
+    Parsing counts against the request budgets (Msg)."""
+
+    address: str  # dotted IPv4, as str(ipaddress.IPv4Address) writes it
+    ports: tuple[int, int]  # lowest and highest relay port
+
+    def fields(self, data: bytes) -> bytes:
+        """The encoded fields (MapValue entries) of a document as delivered."""
+        if not SIGNALING_BYTES.search(data):
+            return data
+        entries = _map_items(data)
+        if entries is None:
+            return b""  # stored fields are always well formed (encode_map); deliver none, not unchecked ones
+        kept = self._entries(entries, 0)
+        return data if kept is None else kept
+
+    def value(self, raw: bytes, depth: int = 0) -> bytes:
+        """An encoded common.Value as delivered: `raw` itself when nothing in it changes."""
+        if not SIGNALING_BYTES.search(raw):
+            return raw
+        if depth >= MAX_SIGNALING_DEPTH:
+            return NULL_VALUE
+        try:
+            fields = [(number, wire, item) for number, items in Msg(raw).fields.items() for wire, item in items]
+        except ValueError:
+            return NULL_VALUE
+        if len(fields) != 1:
+            return NULL_VALUE
+        number, wire, data = fields[0]
+        if wire != 2:
+            return raw  # a number or a boolean
+        if number in (7, 8):  # string_value, bytes_value
+            if SDP_START.match(data):
+                sdp = self.sdp(data)
+                return NULL_VALUE if sdp is None else encode((number, sdp))
+            return NULL_VALUE if SIGNALING_TEXT.search(data) else raw
+        if number == 9:  # array_value (ArrayValue.values 1)
+            items = _only_field(data, 1)
+            if items is None:
+                return NULL_VALUE
+            kept = [self.value(item, depth + 1) for item in items]
+            if all(new is old for new, old in zip(kept, items)):
+                return raw
+            return encode((9, encode(*[(1, item) for item in kept])))
+        if number == 10:  # map_value
+            entries = _map_items(data)
+            if entries is None:
+                return NULL_VALUE
+            kept_entries = self._entries(entries, depth + 1)
+            return raw if kept_entries is None else encode((10, kept_entries))
+        return NULL_VALUE if SIGNALING_BYTES.search(data) else raw  # a timestamp, or unknown
+
+    def _entries(self, entries: list[tuple[bytes, bytes]], depth: int) -> bytes | None:
+        """MapValue entries as delivered, encoded, or None when every value is passed on as is."""
+        kept = [(key, self.value(item, depth)) for key, item in entries]
+        if all(new is old for (_, new), (_, old) in zip(kept, entries)):
+            return None
+        return encode(*[(1, encode((1, key), (2, item))) for key, item in kept])
+
+    def sdp(self, data: bytes) -> bytes | None:
+        """A session description as delivered, or None when it is dropped whole: over MAX_SDP_BYTES
+        or MAX_SDP_LINES, a line that is not printable ASCII "<letter>=<value>" (empty lines pass),
+        a second v= line, or an o= or m= line that does not parse. Of the rest, v=, t= and b= pass
+        as they are, s= becomes "-", o= keeps its session id and version with address 0.0.0.0, c=
+        becomes 0.0.0.0, m= keeps its media, protocol and formats with port 9 (0 stays 0), candidates
+        pass as `candidate` rebuilds them, and attributes only when SDP_KEPT_ATTRIBUTES lists them.
+        Every other line (i=, u=, e=, p=, z=, k=, r=, a=rtcp, a=remote-candidates and attributes not
+        listed) may carry an address and is left out. Lines end as the first one does."""
+        if len(data) > MAX_SDP_BYTES or not SDP_START.match(data):
+            return None
+        newline = b"\r\n" if data.split(b"\n", 1)[0].endswith(b"\r") else b"\n"
+        lines = data.split(b"\n")
+        ended = not lines[-1]  # the last line ends with a newline
+        if ended:
+            lines.pop()
+        if len(lines) > MAX_SDP_LINES:
+            return None
+        out: list[bytes] = []
+        for index, line in enumerate(lines):
+            if line.endswith(b"\r"):
+                line = line[:-1]
+            if not line:
+                out.append(line)
+                continue
+            match = SDP_LINE.fullmatch(line)
+            if match is None:
+                return None
+            kind, value = match.groups()
+            if kind == b"v":
+                if index:
+                    return None
+                out.append(line)
+            elif kind == b"o":
+                if (origin := SDP_ORIGIN.fullmatch(value)) is None:
+                    return None
+                out.append(b"o=- %s %s IN IP4 0.0.0.0" % origin.groups())
+            elif kind == b"s":
+                out.append(b"s=-")
+            elif kind == b"c":
+                out.append(b"c=IN IP4 0.0.0.0")
+            elif kind == b"m":
+                if (media := SDP_MEDIA.fullmatch(value)) is None:
+                    return None
+                out.append(b"m=%s %s %s" % (media[1], b"0" if int(media[2]) == 0 else b"9", media[3]))
+            elif kind in (b"t", b"b"):
+                if (SDP_TIMING if kind == b"t" else SDP_BANDWIDTH).fullmatch(value):
+                    out.append(line)
+            elif kind == b"a":
+                if value.startswith(b"candidate:"):
+                    if (candidate := self.candidate(value)) is not None:
+                        out.append(b"a=" + candidate)
+                elif SDP_KEPT_ATTRIBUTES.fullmatch(value):
+                    out.append(line)
+        return newline.join(out) + (newline if ended else b"")
+
+    def candidate(self, value: bytes) -> bytes | None:
+        """An a=candidate value (RFC 8839) as delivered, or None when it is left out: anything but a
+        UDP relay candidate at `address` on a port in `ports`, and anything that does not parse. Its
+        raddr and rport, the player's own address the TURN server saw, become 0.0.0.0 and 0; of its
+        other extensions only SDP_CANDIDATE_EXTENSIONS pass, each once."""
+        match = SDP_CANDIDATE.fullmatch(value)
+        if match is None:
+            return None
+        foundation, component, transport, priority, address, port, kind, rest = match.groups()
+        if (transport.lower() != b"udp" or kind != b"relay" or address != self.address.encode()
+                or not 1 <= int(component) <= 256 or int(priority) > 0xFFFFFFFF
+                or not self.ports[0] <= int(port) <= self.ports[1]):
+            return None
+        words = rest.split()
+        related = False
+        extensions: dict[bytes, bytes] = {}
+        for name, item in zip(words[::2], words[1::2]):
+            if name in (b"raddr", b"rport"):
+                related = True
+            elif name not in extensions and (pattern := SDP_CANDIDATE_EXTENSIONS.get(name)) and pattern.fullmatch(item):
+                extensions[name] = item
+        out = b"candidate:%s %d %s %d %s %d typ relay" % (foundation, int(component), transport, int(priority),
+                                                          address, int(port))
+        if related:
+            out += b" raddr 0.0.0.0 rport 0"
+        return out + b"".join(b" %s %s" % pair for pair in extensions.items())
+
+
+def log_gamesync_sdp(changes: dict[str, dict | None], writer: str, relay: RelayOnly | None = None) -> None:
     """Logs the session descriptions in committed gamesync documents: their candidate lines at
-    INFO, every byte at DEBUG (-v). ICE credentials (a=ice-pwd) stay out of the INFO line."""
+    INFO, every byte at DEBUG (-v). ICE credentials (a=ice-pwd) stay out of the INFO line. In
+    relay-only mode (RelayOnly) the INFO line counts the candidates written and lists the ones
+    delivered instead, so it names no address of a player; DEBUG still has every byte. Looking for
+    them parses each document within the writing call's request budgets (Msg); a document that does
+    not fit them is logged without its session descriptions, because its write is already committed
+    and must still be answered."""
     for name, doc in changes.items():
         if doc is None:
             continue
-        for path, data in sdp_values(doc_entries(doc)):
+        try:
+            found = sdp_values(doc_entries(doc))
+        except GrpcError as exc:
+            if exc.code != RESOURCE_EXHAUSTED:
+                raise
+            log.info("gamesync %s written by %s: SDP not looked for (%s)", name, writer or "-", exc.message)
+            continue
+        for path, data in found:
             lines = data.decode("utf-8", "backslashreplace").splitlines(keepends=True)
             candidates = [line.rstrip() for line in lines if line.startswith("a=candidate")]
-            log.info("gamesync %s %s written by %s: SDP (%s); candidates: %s", name, path, writer or "-",
-                     describe_sdp(data), "; ".join(candidates) or "none")
+            if relay is None:
+                log.info("gamesync %s %s written by %s: SDP (%s); candidates: %s", name, path, writer or "-",
+                         describe_sdp(data), "; ".join(candidates) or "none")
+            else:
+                delivered = relay.sdp(data)
+                kept = [] if delivered is None else [
+                    line for line in delivered.decode().splitlines() if line.startswith("a=candidate")]
+                log.info("gamesync %s %s written by %s: SDP (%s) with %d candidate(s); relay-only delivers %s",
+                         name, path, writer or "-", describe_sdp(data), len(candidates),
+                         "nothing (dropped whole)" if delivered is None else
+                         f"SDP ({describe_sdp(delivered)}); candidates: {'; '.join(kept) or 'none'}")
             if log.isEnabledFor(logging.DEBUG):
                 log.debug("SDP %s %s, hex %s:\n%s", name, path, data.hex(),
                           "\n".join(f"  {line!r}" for line in lines))
+
+
+def log_description(describe: Callable[..., str]) -> Callable[..., str]:
+    """Makes `describe`, which summarizes request or gamesync data for an INFO line, leave its
+    summary out when what it parses does not fit the request budgets (Msg, RESOURCE_EXHAUSTED) it
+    shares with the call it describes, because logging must not change how a call is answered.
+    Only that is left out: data that does not decode still fails."""
+
+    @functools.wraps(describe)
+    def described(*args: object) -> str:
+        try:
+            return describe(*args)
+        except GrpcError as exc:
+            if exc.code != RESOURCE_EXHAUSTED:
+                raise
+            return f"<not described: {exc.message}>"
+
+    return described
+
+
+@log_description
+def describe_user_session_document(entries: dict[str, bytes]) -> str:
+    """Summarizes the ids in a user session's docs/__us document for the log."""
+    try:
+        return (f"uid={Msg(entries['uid']).get_str(7) or '-'} ussid={Msg(entries['ussid']).get_int(3)} "
+                f"ucsid={Msg(entries['ucsid']).get_int(3)}")
+    except ValueError:
+        return "<not described: malformed stored user session>"
 
 
 def describe_target(target: Msg) -> str:
@@ -1699,6 +2275,7 @@ def describe_target(target: Msg) -> str:
     return f"{target.get_str(1)!r} on {watched}"
 
 
+@log_description
 def describe_keep_user_session_request(req: Msg) -> str:
     """Summarizes a KeepUserSessionRequest for the log."""
     if req.has(2):
@@ -1710,6 +2287,7 @@ def describe_keep_user_session_request(req: Msg) -> str:
     return "no request"
 
 
+@log_description
 def describe_keep_user_session_response(message: bytes) -> str:
     """Summarizes a KeepUserSessionResponse for the log."""
     msg = Msg(message)
@@ -1735,19 +2313,23 @@ GAMESYNC = "/nn.npln.gamesync.v1.Gamesync/"
 
 
 class Backend:
-    def __init__(self, store: Store, storage: Storage, max_players: int, stun: str, gamesync_port: int):
+    def __init__(self, store: Store, storage: Storage, max_players: int, stun: str, gamesync_port: int,
+                 turn: TurnServer | None = None, relay: RelayOnly | None = None):
         self.store = store
         self.storage = storage
         self.signer = TokenSigner(store.secret)
         self.max_players = max_players
         self.stun = stun
         self.gamesync_port = gamesync_port
+        self.turn = turn  # handed out by AllocateIceServerSet with credentials (--turn)
+        self.relay = relay  # relay-only delivery of gamesync documents (--relay-only)
         self.sessions: dict[str, GameSession] = {}
         self.tickets: dict[str, CreationTicket] = {}
         # Client-certificate mode: (account, island owner) -> (monotonic expiry, password_version) of
         # what a right island password allows (finding the owner's game session, reading its
         # StageData), and the counts of wrong passwords.
         self.password_grants: dict[tuple[str, str], tuple[float, str]] = {}
+        self.storage.stage_download_allowed = self.stage_attachment_allowed
         self.guesses = GuessLimiter()
         self.unary: dict[str, Callable[[Call, Msg], bytes]] = {
             AUTH + "CreateUser": self.create_user,
@@ -1800,27 +2382,24 @@ class Backend:
     # Names and identities
 
     def resolve(self, call: Call, name: str) -> str:
-        """Expands the "tenants/current" alias using the npln-tenant-id metadata, the
-        "userSessions/current" alias to the user session the gamesync token was issued for and the
-        "users/current" alias to the user the bearer access token was issued to."""
-        tenant_id = call.metadata.get("npln-tenant-id")
-        if tenant_id and (name == "tenants/current" or name.startswith("tenants/current/")):
-            name = f"tenants/{tenant_id}{name[len('tenants/current'):]}"
-        if name == "userSessions/current" or name.startswith("userSessions/current/"):
-            user_session = (self.caller(call, "gamesync") or {}).get("user_session")
-            if user_session:
-                name = f"{user_session}{name[len('userSessions/current'):]}"
-        if "users/current" not in name:
-            return name
-        caller = self.caller(call)
-        if not caller or "sub" not in caller:
-            return name
-        user_id = caller["sub"].rpartition("/users/")[2]
-        segments = name.split("/")
-        for i in range(len(segments) - 1):
-            if segments[i] == "users" and segments[i + 1] == "current":
-                segments[i + 1] = user_id
-        return "/".join(segments)
+        """Expands the aliases in `name` (Aliases), verifying only the tokens they need."""
+        return self.aliases(call, name).expand(name)
+
+    def aliases(self, call: Call, name: str | None = None) -> Aliases:
+        """What the aliases in `call`'s names stand for now: those in `name`, so only the tokens they
+        need are verified, or all of them. A deferred write keeps them (gamesync_commit), so its
+        names resolve as they did when it was stored, even after the tokens of that call expire."""
+        user_session = user_id = ""
+        gamesync: dict | None = None
+        if name is None or name == "userSessions/current" or name.startswith("userSessions/current/"):
+            gamesync = self.caller(call, "gamesync") or {}
+            user_session = gamesync.get("user_session") or ""
+        if name is None or "users/current" in name:
+            # A Gamesync call carries a gamesync token instead of an access token; its user is the
+            # one that token was issued to (and gamesync_route checked).
+            caller = self.caller(call) or (self.caller(call, "gamesync") if gamesync is None else gamesync) or {}
+            user_id = caller["sub"].rpartition("/users/")[2] if "sub" in caller else ""
+        return Aliases(call.metadata.get("npln-tenant-id", ""), user_session, user_id)
 
     def caller(self, call: Call, typ: str = "access") -> dict | None:
         scheme, _, token = call.metadata.get("authorization", "").partition(" ")
@@ -2013,9 +2592,11 @@ class Backend:
         are not public; these follow what the game does. An account reads and writes the documents
         of its own users (tenants/<t>/documents/users/<u>/...). Of another account's documents it
         only reads public/ ones, private/SessionIDData given that island's password as rule context
-        "password" (as when joining a Cloud Island) and, for PASSWORD_GRANT_SECONDS after that,
-        private/StageData. Writes, attachment URIs and all other documents are the owner's alone.
-        The account comes from the connection, so this does not depend on a bearer token."""
+        "password" (as when joining a Cloud Island) and private/StageData for PASSWORD_GRANT_SECONDS
+        after that or while it is in that island's game session (island_member). Writes (but a
+        Cloud Island save, check_write_access), other attachment URIs and all other documents are
+        the owner's alone. The account comes from the connection, so this does not depend on a
+        bearer token."""
         if call.principal is None:
             return
         owner = document_owner(name)
@@ -2034,18 +2615,41 @@ class Backend:
                 self.password_grants[(call.principal.account, owner)] = (
                     now + PASSWORD_GRANT_SECONDS, self.island_password_version(owner))
                 return
-            if document == "StageData" and self.has_grant(call, owner):
+            if document == "StageData" and (self.has_grant(call, owner) or self.island_member(call, owner)):
                 return
         raise GrpcError(PERMISSION_DENIED, f"no access to {name}")
 
+    def island_string(self, owner: str, document: str, key: str) -> str:
+        """The string field `key` of `owner`'s private/`document`, or "" if there is none."""
+        tenant, _, user_id = owner.partition("/users/")
+        doc = self.store.documents.get(f"{tenant}/documents/users/{user_id}/private/{document}")
+        return Msg(doc_entries(doc).get(key) or b"").get_str(7)
+
     def island_password(self, owner: str) -> str:
         """The password in `owner`'s private/PasswordData, or "" if there is none."""
-        tenant, _, user_id = owner.partition("/users/")
-        password_doc = self.store.documents.get(f"{tenant}/documents/users/{user_id}/private/PasswordData")
-        return Msg(doc_entries(password_doc).get("password") or b"").get_str(7)
+        return self.island_string(owner, "PasswordData", "password")
 
     def island_password_version(self, owner: str) -> str:
         return password_version(self.island_password(owner))
+
+    def hosted_island(self, call: Call, properties_raw: bytes | None) -> str:
+        """Client-certificate mode: the user whose Cloud Island a new game session hosts, or "". The
+        game finds an island's session by its property string1, ":" + the island's sessionID (the
+        owner's private/SessionIDData), and whoever opens the island, its owner or a visitor while
+        the owner is away, creates the session with it. Only islands of the caller's own users, and
+        those it holds a current password grant for, count, so nobody hosts an island they could
+        not open."""
+        if call.principal is None:
+            return ""
+        string1 = Msg(map_entries(properties_raw).get("string1") or b"").get_str(7)
+        if len(string1) < 2 or not string1.startswith(":"):
+            return ""
+        account = call.principal.account
+        own = [name for name, user in self.store.users.items() if user.get("owner") == account]
+        granted = [owner for holder, owner in self.password_grants
+                   if holder == account and self.has_grant(call, owner)]
+        return next((owner for owner in [*own, *granted]
+                     if self.island_string(owner, "SessionIDData", "sessionID") == string1[1:]), "")
 
     def has_grant(self, call: Call, owner: str) -> bool:
         """Whether the caller's account gave `owner`'s current island password within
@@ -2053,6 +2657,57 @@ class Backend:
         grant = self.password_grants.get((call.principal.account, owner))
         return (grant is not None and grant[0] > time.monotonic() and bool(self.island_password(owner))
                 and grant[1] == self.island_password_version(owner))
+
+    def island_member(self, call: Call, owner: str) -> bool:
+        """Whether a user of the caller's account is in a game session that hosts `owner`'s Cloud
+        Island (GameSession.island, or else its creator), its game is still there
+        (user_session_gone), and it joined under `owner`'s current island password. Any such player
+        may host the island: the owner hands hosting over on leaving, and a visitor opens it while
+        the owner is away. The host reads and saves the island, however long after joining. A new or
+        removed password ends this, as it ends grants."""
+        if not self.island_password(owner):
+            return False
+        version = self.island_password_version(owner)
+        now = time.time_ns()
+        return any((session.island or session.creator) == owner
+                   and user_session.island_password_version == version
+                   and self.owns(call, user) and not self.user_session_gone(session, user_session, now)
+                   for session in self.sessions.values()
+                   for user, user_session in session.user_sessions.items())
+
+    def stage_attachment_allowed(self, principal: Principal, name: str) -> bool:
+        """Whether another account may download `name`'s attachment: only private/StageData's, with
+        a current password grant or while in that island's game session (island_member)."""
+        match = USER_DOCUMENT.fullmatch(name)
+        if not match or match.group(3, 4) != ("private", "StageData"):
+            return False
+        call, owner = Call("", {}, principal), document_owner(name)
+        return self.has_grant(call, owner) or self.island_member(call, owner)
+
+    def check_write_access(self, call: Call, name: str, staging: Staging, island_documents: frozenset[str]) -> None:
+        """check_document_access(owner_only=True) for a write of a commit, except that the commit may
+        also write the `island_documents` (ISLAND_SAVE_UPDATES, ISLAND_SAVE_IMPORTS) of another
+        account's user when it saves that user's Cloud Island (may_save_island). They need not exist
+        yet: an island its owner left before saving it once has no StageData."""
+        match = USER_DOCUMENT.fullmatch(name)
+        if call.principal is not None and match and "/".join(match.group(3, 4)) in island_documents:
+            owner = document_owner(name)
+            if not self.owns(call, owner):
+                if owner not in staging.island_saves:
+                    staging.island_saves[owner] = self.may_save_island(call, owner, staging.rule_context)
+                if staging.island_saves[owner]:
+                    return
+        self.check_document_access(call, name, owner_only=True)
+
+    def may_save_island(self, call: Call, owner: str, rule_context: bytes | None) -> bool:
+        """Whether the caller may save `owner`'s Cloud Island as its host: a user of its account is
+        in the island's game session (island_member), and the commit's rule context holds the
+        island's current password, as the game sends it with every save (wrong ones count as
+        guesses, check_password)."""
+        if not (self.island_member(call, owner) and self.check_island_password(call, owner, rule_context)):
+            return False
+        log.info("account %s saves the island of %s as its host", call.principal.account, owner)
+        return True
 
     def check_island_password(self, call: Call, owner: str, rule_context: bytes | None) -> bool:
         """Whether the rule context carries the password of `owner`'s private/PasswordData."""
@@ -2075,31 +2730,42 @@ class Backend:
 
     def session_visible(self, call: Call, session: GameSession) -> bool:
         """Client-certificate mode: whether the caller may see a game session at all. It must have a
-        user in it, or have given the current island password of the user who created it (the
-        island's owner, who hosts it) within PASSWORD_GRANT_SECONDS; a grant for another member's
-        island does not count. The host's properties carry the island's session id, which only the
-        password-protected private/SessionIDData otherwise reveals."""
+        user in it, or own the island the session hosts (GameSession.island, or else its creator), or
+        have given that island's current password within PASSWORD_GRANT_SECONDS; a grant for another
+        member's island does not count. So an island's visitors and its owner find the session a
+        visitor opened it in while the owner was away. The host's properties carry the island's
+        session id, which only the password-protected private/SessionIDData otherwise reveals."""
         if call.principal is None or any(self.owns(call, user) for user in session.user_sessions):
             return True
-        return bool(session.creator) and self.has_grant(call, session.creator)
+        island = session.island or session.creator
+        return bool(island) and (self.owns(call, island) or self.has_grant(call, island))
 
     def check_commit_room(self, call: Call, staging: Staging) -> None:
         """Refuses a Ugcstore commit that would break a document or storage limit (Storage.room_for,
-        MAX_DOCUMENTS_PER_USER). Each upload a commit imports counts once, as apply_write refuses
-        importing one twice. Shrinking commits always pass."""
-        state = blobs = 0
+        MAX_DOCUMENTS_PER_USER). A document's growth counts against the account of its user, which
+        for a Cloud Island save (check_write_access) is not the committing account; an imported
+        upload leaves the committing account's, which uploaded it. Each upload a commit imports
+        counts once, as apply_write refuses importing one twice. Shrinking always passes."""
+        account = call.principal.account if call.principal is not None else None
+        growth: dict[str | None, list[int]] = {}  # account -> [state bytes, blob bytes]
         for name, doc in staging.changes.items():
             old = self.store.documents.get(name)
-            state += document_state_bytes(name, doc) - document_state_bytes(name, old)
-            blobs += (doc.get("attachment") or {}).get("size", 0) if doc else 0
-            blobs -= (old.get("attachment") or {}).get("size", 0) if old else 0
+            user = self.store.users.get(document_owner(name) or "") if account is not None else None
+            counts = growth.setdefault((user or {}).get("owner") or account, [0, 0])
+            counts[0] += document_state_bytes(name, doc) - document_state_bytes(name, old)
+            counts[1] += (doc.get("attachment") or {}).get("size", 0) if doc else 0
+            counts[1] -= (old.get("attachment") or {}).get("size", 0) if old else 0
         for upload_id in staging.imported_uploads:
-            state -= STATE_OVERHEAD_BYTES
-            blobs -= self.store.uploads[upload_id]["received"]
-        account = call.principal.account if call.principal is not None else None
-        problem = self.storage.room_for(account, state, blobs)
-        if problem is not None:
-            raise GrpcError(RESOURCE_EXHAUSTED, problem)
+            counts = growth.setdefault(account, [0, 0])
+            counts[0] -= STATE_OVERHEAD_BYTES
+            counts[1] -= self.store.uploads[upload_id]["received"]
+        checks = [(holder, state, blobs) for holder, (state, blobs) in growth.items()]
+        if len(checks) > 1:  # each account's own growth, then the server's
+            checks.append((None, sum(state for _, state, _ in checks), sum(blobs for _, _, blobs in checks)))
+        for holder, state, blobs in checks:
+            problem = self.storage.room_for(holder, state, blobs)
+            if problem is not None:
+                raise GrpcError(RESOURCE_EXHAUSTED, problem)
         if account is None:
             return
         for owner in {document_owner(name) for name, doc in staging.changes.items()
@@ -2137,7 +2803,7 @@ class Backend:
 
     def commit_documents(self, call: Call, req: Msg) -> bytes:
         now = time.time_ns()
-        staging = Staging(self.store.documents)
+        staging = Staging(self.store.documents, req.get_bytes(3))
         try:
             results = [self.apply_write(call, op, staging, now) for op in req.get_msgs(2)]
             self.check_commit_room(call, staging)
@@ -2171,7 +2837,7 @@ class Backend:
         if (update := op.get_msg(1)) is not None:
             document = update.get_msg(1) or Msg()
             name = self.resolve(call, document.get_str(1))
-            self.check_document_access(call, name, owner_only=True)
+            self.check_write_access(call, name, staging, ISLAND_SAVE_UPDATES)
             check_name(name)
             doc = staging.get(name)
             check_precondition(name, doc, update.get_msg(3))
@@ -2196,18 +2862,18 @@ class Backend:
             for field_transform in transform.get_msgs(2):
                 path = field_transform.get_str(1)
                 if field_transform.has(2):
-                    entries, result = apply_transform(entries, path, "request_time", None, now)
+                    result = apply_transform(entries, split_field_path(path), "request_time", None, now)
                 else:
                     kinds = {3: "increment", 4: "maximum", 5: "minimum", 6: "increment"}
                     number = next((n for n in kinds if field_transform.has(n)), None)
                     if number is None:
                         raise GrpcError(INVALID_ARGUMENT, f"empty transform for {path}")
-                    entries, result = apply_transform(entries, path, kinds[number],
-                                                      field_transform.get_bytes(number), now)
+                    result = apply_transform(entries, split_field_path(path), kinds[number],
+                                             field_transform.get_bytes(number), now)
                 results.append(result)
             for buffered in transform.get_msgs(3):
-                entries, _ = apply_transform(entries, buffered.get_str(1), "increment",
-                                             buffered.get_bytes(2), now)
+                apply_transform(entries, split_field_path(buffered.get_str(1)), "increment",
+                                buffered.get_bytes(2), now)
             staging.put(name, updated_document(doc, now, entries))
             return encode((1, timestamp(now)), *[(2, result) for result in results])
 
@@ -2243,7 +2909,7 @@ class Backend:
 
         if (imported := op.get_msg(5)) is not None:
             name = self.resolve(call, imported.get_str(1))
-            self.check_document_access(call, name, owner_only=True)
+            self.check_write_access(call, name, staging, ISLAND_SAVE_IMPORTS)
             check_name(name)
             check_name(imported.get_str(3))
             uri = imported.get_str(2)
@@ -2274,7 +2940,8 @@ class Backend:
 
     def issue_attachment_uri(self, call: Call, req: Msg) -> bytes:
         name = self.resolve(call, req.get_str(1))
-        self.check_document_access(call, name, owner_only=True)
+        if call.principal is None or not self.stage_attachment_allowed(call.principal, name):
+            self.check_document_access(call, name, owner_only=True)
         doc = self.store.documents.get(name)
         attachment = doc.get("attachment") if doc else None
         if attachment is None:
@@ -2363,7 +3030,8 @@ class Backend:
                     raise GrpcError(RESOURCE_EXHAUSTED, f"{session.name} is full")
                 self.leave_other_sessions(user, session)
                 user_session = UserSession(f"{session.name}/userSessions/{random_id()}", user,
-                                           definition, now, now)
+                                           definition, now, now,
+                                           self.island_password_version(session.island or session.creator))
                 session.user_sessions[user] = user_session
             token = self.signer.issue(typ="matchmaking", sub=user, game_session=session.name,
                                       **self.owner_claims(call),
@@ -2381,46 +3049,58 @@ class Backend:
                 self.drop_user_session(session, user)
 
     def drop_user_session(self, session: GameSession, user: str) -> None:
-        """Removes a user from a game session. While others remain in it, the user session's
-        deferred gamesync writes are applied, its KeepUserSession calls end and the gamesync
-        documents named after it (docs/__us/<id>, docs/__pgn/All/__pus/<id>, ...) are deleted. A
-        game session left empty is dropped with its creation tickets and all of its gamesync state,
-        and its remaining KeepUserSession calls end."""
+        """Removes a user from a game session. Its KeepUserSession calls end first, so nothing it
+        opened reads the game session anymore, whatever happens next. While others remain in it, the
+        user session's deferred gamesync writes are then queued to be applied, and after them the
+        deletion of the gamesync documents named after it (docs/__us/<id>, docs/__pgn/All/__pus/<id>,
+        ...), which happens even if they fail (gamesync_fire_deferments). A game session left empty
+        is dropped with its creation tickets and all of its gamesync state, deferred writes still
+        queued included, and its remaining KeepUserSession calls end."""
         user_session = session.user_sessions.pop(user, None)
         if user_session is None:
             return
         space = session.gamesync
         log.info("dropped %s", user_session.name)
         if session.user_sessions:
-            self.gamesync_fire_deferments(space, user_session.name)
-            session_id = user_session.name.rpartition("/")[2]
-            stale = [name for name in space.docs if name.rpartition("/")[2] == session_id]
             ending = [watcher for watcher in space.watchers if watcher.member is user_session]
         else:
             self.sessions.pop(session.name, None)
             self.tickets = {name: ticket for name, ticket in self.tickets.items() if ticket.session is not session}
-            stale = list(space.docs)
             ending = list(space.watchers)
             space.globals.clear()
             space.transactions.clear()
             space.deferments.clear()
+            space.queue.clear()  # its applier, if any, finds nothing left to do
             log.info("dropped %s", session.name)
         for watcher in ending:
             space.watchers.discard(watcher)
             watcher.end(GrpcError(NOT_FOUND, f"{watcher.member.name} has left its game session"))
-        for name in stale:
+        if session.user_sessions:
+            self.gamesync_fire_deferments(session, user_session.name, left=True)
+        else:
+            self.gamesync_delete(space, list(space.docs))
+
+    def gamesync_delete(self, space: GamesyncSpace, names: list[str]) -> None:
+        """Deletes gamesync documents outside any commit and tells the watchers."""
+        for name in names:
             del space.docs[name]
-        if stale:
-            self.gamesync_notify(space, dict.fromkeys(stale), set())
-            log.info("gamesync deleted %s", ", ".join(stale))
+        if names:
+            self.gamesync_notify(space, dict.fromkeys(names), set())
+            log.info("gamesync deleted %s", ", ".join(names))
+
+    @staticmethod
+    def user_session_gone(session: GameSession, user_session: UserSession, now: int) -> bool:
+        """Whether the game of `user_session` is gone: it has had no KeepUserSession call open in
+        `session` for USER_SESSION_GRACE_SECONDS."""
+        return (user_session.last_seen < now - USER_SESSION_GRACE_SECONDS * 1_000_000_000
+                and all(watcher.member.name != user_session.name for watcher in session.gamesync.watchers))
 
     def prune_sessions(self) -> None:
-        """Drops the user sessions whose game is gone; see USER_SESSION_GRACE_SECONDS."""
-        cutoff = time.time_ns() - USER_SESSION_GRACE_SECONDS * 1_000_000_000
+        """Drops the user sessions whose game is gone (user_session_gone)."""
+        now = time.time_ns()
         for session in list(self.sessions.values()):
-            connected = {watcher.member.name for watcher in session.gamesync.watchers}
             for user, user_session in list(session.user_sessions.items()):
-                if user_session.last_seen < cutoff and user_session.name not in connected:
+                if self.user_session_gone(session, user_session, now):
                     log.info("%s has had no KeepUserSession call open for %ds", user_session.name,
                              USER_SESSION_GRACE_SECONDS)
                     self.drop_user_session(session, user)
@@ -2480,14 +3160,16 @@ class Backend:
                               GAMESYNC_HOST, self.gamesync_port,
                               password=req_session.get_str(6),
                               properties_raw=req_session.get_bytes(11),
-                              creator=Msg(definitions[0]).get_str(1) if definitions else "")
+                              creator=Msg(definitions[0]).get_str(1) if definitions else "",
+                              island=self.hosted_island(call, req_session.get_bytes(11)))
         matched = self.join(call, session, definitions, now)
         self.sessions[session.name] = session
         ticket = CreationTicket(f"{parent}/gameSessionCreationTickets/{random_id()}",
                                 ticket_request.get_str(2), definitions, session, matched,
                                 TICKET_PENDING)
         self.tickets[ticket.name] = ticket
-        log.info("created %s for %s", session.name, ", ".join(session.user_sessions) or "-")
+        log.info("created %s for %s (island %s)", session.name, ", ".join(session.user_sessions) or "-",
+                 session.island or "-")
         return ticket.encode()
 
     async def track_game_session_creation_ticket(self, call: Call, req: Msg) -> AsyncIterator[bytes]:
@@ -2546,16 +3228,29 @@ class Backend:
                         if user in session.user_sessions])
 
     def allocate_ice_server_set(self, call: Call, req: Msg) -> bytes:
+        """An IceServerSet: the STUN server (field 2) and, with --turn, the TURN server (field 3:
+        host 1, port 2, protocol 3, username 4, password 5) with credentials of its own. Its
+        password is never logged, -v included (Server.handle_grpc)."""
         tenant = self.resolve(call, req.get_str(1))
-        stun = None
+        now = time.time_ns()
+        stun = turn = None
         if self.stun:
             host, _, port = self.stun.rpartition(":")
             stun = encode((1, host), (2, int(port)), (3, STUN_PROTOCOL_UDP))
+        if self.turn is not None:
+            # Client-certificate mode: the TURN server's log names the account by an id derived
+            # from it, the same for each allocation; local mode authenticates nobody.
+            user = derived_id("turn", call.principal.account) if call.principal is not None else random_id()
+            username, password = self.turn.credentials(user, now // 1_000_000_000)
+            turn = encode((1, self.turn.host), (2, self.turn.port), (3, STUN_PROTOCOL_UDP),
+                          (4, username), (5, password))
+            log.info("AllocateIceServerSet: TURN %s:%d for %s", self.turn.host, self.turn.port, username)
         return encode(
             (1, f"{tenant}/iceServerSets/{random_id()}"),
             (2, stun),
+            (3, turn),
             (4, duration(ICE_SERVER_TTL_SECONDS)),
-            (5, timestamp(time.time_ns())),
+            (5, timestamp(now)),
             (6, duration(ICE_SERVER_TTL_SECONDS)),
         )
 
@@ -2630,23 +3325,32 @@ class Backend:
     def gamesync_get_document(self, call: Call, req: Msg) -> bytes:
         space = self.gamesync_route(call)[0].gamesync
         name = self.resolve(call, req.get_str(1))
+        check_name(name)
         doc = self.gamesync_read(space, name, req.get_bytes(3))
         if doc is None:
             raise GrpcError(NOT_FOUND, f"{name} not found")
-        return encode_document(name, doc, req.get_msg(2))
+        return encode_document(name, doc, read_mask_paths(req.get_msg(2)), GamesyncReadWork(), self.relay)
 
     def gamesync_read_documents(self, call: Call, req: Msg) -> bytes:
         space = self.gamesync_route(call)[0].gamesync
-        mask, transaction = req.get_msg(2), req.get_bytes(3)
+        paths, transaction = read_mask_paths(req.get_msg(2)), req.get_bytes(3)
+        work = GamesyncReadWork()
         results = []
-        for name in [self.resolve(call, name) for name in req.get_strs(1)]:
+        for raw_name in req.get_strs(1):
+            name = self.resolve(call, raw_name)
+            check_name(name)
             doc = self.gamesync_read(space, name, transaction)
-            results.append(encode((1, encode_document(name, doc, mask))) if doc else encode((2, name)))
+            if doc:
+                results.append(encode((1, encode_document(name, doc, paths, work, self.relay))))
+            else:
+                work.spend(len(name) + STATE_OVERHEAD_BYTES)
+                results.append(encode((2, name)))
         return encode(*[(1, result) for result in results], (2, timestamp(time.time_ns())))
 
     def gamesync_list_documents(self, call: Call, req: Msg) -> bytes:
         space = self.gamesync_route(call)[0].gamesync
         prefix = self.resolve(call, req.get_str(1)).rstrip("/") + "/"
+        check_name(prefix)
         found: dict[str, dict | None] = {}
         for name, doc in space.docs.items():
             if not name.startswith(prefix):
@@ -2657,9 +3361,15 @@ class Backend:
             elif req.get_bool(5):  # show_missing: parents that only hold subcollections
                 found.setdefault(prefix + doc_id, None)
         page, next_token = paginate(sorted(found), req.get_int(2), req.get_str(3))
-        mask = req.get_msg(4)
-        documents = [encode_document(name, found[name], mask) if found[name] else encode((1, name))
-                     for name in page]
+        paths = read_mask_paths(req.get_msg(4))
+        work = GamesyncReadWork()
+        documents = []
+        for name in page:
+            if found[name]:
+                documents.append(encode_document(name, found[name], paths, work, self.relay))
+            else:
+                work.spend(len(name) + STATE_OVERHEAD_BYTES)
+                documents.append(encode((1, name)))
         return encode(*[(1, document) for document in documents], (2, next_token or None))
 
     def gamesync_query_collection_ids(self, call: Call, req: Msg) -> bytes:
@@ -2677,7 +3387,7 @@ class Backend:
 
     def gamesync_write_documents(self, call: Call, req: Msg) -> bytes:
         session, member = self.gamesync_route(call)
-        results, now = self.gamesync_commit(session.gamesync, member.name, call, req.get_msgs(1),
+        results, now = self.gamesync_commit(session.gamesync, member.name, self.aliases(call), req.get_msgs(1),
                                             req.get_msgs(2))
         return encode(*[(1, result) for result in results], (2, timestamp(now)))
 
@@ -2686,7 +3396,7 @@ class Backend:
         # LazyWriteOperation numbers merge_document 1 and transform_document 2; WriteOperation
         # numbers them 2 and 3.
         writes = [Msg(encode((2, op.get_bytes(1)), (3, op.get_bytes(2)))) for op in req.get_msgs(1)]
-        _, now = self.gamesync_commit(session.gamesync, member.name, call, writes, [])
+        _, now = self.gamesync_commit(session.gamesync, member.name, self.aliases(call), writes, [])
         return encode((1, timestamp(now)))
 
     def gamesync_begin_transaction(self, call: Call, req: Msg) -> bytes:
@@ -2711,7 +3421,8 @@ class Backend:
             doc = space.docs.get(name)
             if (doc["update_time"] if doc else None) != update_time:
                 raise GrpcError(ABORTED, f"{name} changed during the transaction")
-        results, now = self.gamesync_commit(space, member.name, call, req.get_msgs(1), req.get_msgs(2))
+        results, now = self.gamesync_commit(space, member.name, self.aliases(call), req.get_msgs(1),
+                                            req.get_msgs(2))
         return encode(*[(1, result) for result in results], (2, timestamp(now)))
 
     def gamesync_rollback_transaction(self, call: Call, req: Msg) -> bytes:
@@ -2722,23 +3433,25 @@ class Backend:
         # Round's fields are undocumented; the created round is the requested one.
         return req.get_bytes(1) or b""
 
-    def gamesync_commit(self, space: GamesyncSpace, owner: str, call: Call, writes: Iterable[Msg],
+    def gamesync_commit(self, space: GamesyncSpace, owner: str, aliases: Aliases, writes: Iterable[Msg],
                         deferments: list[Msg]) -> tuple[list[bytes], int]:
         """Applies WriteOperations and DefermentOperations atomically to one game session's gamesync
-        state and notifies its watchers. The deferments stored belong to user session `owner`.
-        `writes` are applied in order as they are taken, so they may be parsed one at a time."""
+        state and notifies its watchers. Names resolve with `aliases` (Backend.aliases), which the
+        deferments stored keep; they belong to user session `owner`. `writes` are applied in order as
+        they are taken, so they may be parsed one at a time, and together cost one GamesyncWork.
+        Deferments queued to be applied still count against the Gamesync limit (GamesyncSpace.queue)."""
         now = time.time_ns()
+        work = GamesyncWork()
         staging = Staging(space.docs)
         staged_globals = dict(space.globals)
-        results = [self.gamesync_apply_write(call, op, staging, staged_globals, now) for op in writes]
+        results = [self.gamesync_apply_write(aliases, op, staging, staged_globals, now, work) for op in writes]
         staged_deferments = dict(space.deferments)
-        kept = deferment_call(call) if deferments else call
         for op in deferments:
             if (update := op.get_msg(1)) is not None:
-                name = self.resolve(call, (update.get_msg(1) or Msg()).get_str(1))
-                staged_deferments[name] = (owner, kept, update.get_bytes(1) or b"")
+                name = aliases.expand((update.get_msg(1) or Msg()).get_str(1))
+                staged_deferments[name] = (owner, aliases, update.get_bytes(1) or b"")
             elif (delete := op.get_msg(2)) is not None:
-                staged_deferments.pop(self.resolve(call, delete.get_str(1)), None)
+                staged_deferments.pop(aliases.expand(delete.get_str(1)), None)
             else:
                 raise GrpcError(INVALID_ARGUMENT, "empty deferment operation")
 
@@ -2747,7 +3460,8 @@ class Backend:
         for name in [*staging.changes, *staged_globals.keys() - space.globals.keys(),
                      *staged_deferments.keys() - space.deferments.keys()]:
             check_name(name)
-        size, records = gamesync_size({**space.docs, **staging.changes}, staged_globals, staged_deferments)
+        size, records = gamesync_size({**space.docs, **staging.changes}, staged_globals, staged_deferments,
+                                      space.queue)
         if size > MAX_GAMESYNC_BYTES or records > MAX_GAMESYNC_RECORDS:
             raise GrpcError(RESOURCE_EXHAUSTED, "the game session's gamesync data is over the limit")
         created = {name for name, doc in staging.changes.items() if doc is not None and name not in space.docs}
@@ -2762,49 +3476,57 @@ class Backend:
         if staging.changes:
             log.info("gamesync committed %d write(s) by %s: %s", len(results), owner,
                      ", ".join(staging.changes))
-            log_gamesync_sdp(staging.changes, owner)
+            log_gamesync_sdp(staging.changes, owner, self.relay)
         return results, now
 
-    def gamesync_apply_write(self, call: Call, op: Msg, staging: Staging, globals_: dict[str, bytes],
-                             now: int) -> bytes:
-        """Stages one gamesync WriteOperation and returns its WriteResult."""
+    def gamesync_apply_write(self, aliases: Aliases, op: Msg, staging: Staging, globals_: dict[str, bytes],
+                             now: int, work: GamesyncWork) -> bytes:
+        """Stages one gamesync WriteOperation and returns its WriteResult. It costs `work`, each
+        before it is copied, STATE_OVERHEAD_BYTES, its document as decoded (doc_entries) and as
+        staged, and what its field transforms, masked paths and merges copy (GamesyncWork)."""
         if (update := op.get_msg(1)) is not None:
             document = update.get_msg(1) or Msg()
-            name = self.resolve(call, document.get_str(1))
+            name = aliases.expand(document.get_str(1))
             doc = staging.get(name)
             check_precondition(name, doc, update.get_msg(3))
-            entries = masked_entries(doc, map_entries(document.get_bytes(2)), update.get_msg(2))
-            staging.put(name, updated_document(doc, now, entries))
-            return encode((1, b""))  # UpdateResult
-
-        if (merge := op.get_msg(2)) is not None:
+            entries = masked_entries(doc, map_entries(document.get_bytes(2)), update.get_msg(2), work)
+            result = encode((1, b""))  # UpdateResult
+        elif (merge := op.get_msg(2)) is not None:
             document = merge.get_msg(1) or Msg()
-            name = self.resolve(call, document.get_str(1))
+            name = aliases.expand(document.get_str(1))
             doc = staging.get(name)
-            entries = merge_entries(doc_entries(doc), map_entries(document.get_bytes(2)))
-            staging.put(name, updated_document(doc, now, entries))
-            return encode((1, b""))  # UpdateResult
-
-        if (transform := op.get_msg(3)) is not None:
-            name = self.resolve(call, transform.get_str(1))
+            entries = merge_entries(doc_entries(doc, work), map_entries(document.get_bytes(2)), work)
+            result = encode((1, b""))  # UpdateResult
+        elif (transform := op.get_msg(3)) is not None:
+            name = aliases.expand(transform.get_str(1))
             doc = staging.get(name)
-            entries = doc_entries(doc)
-            results = []
-            for field_transform in transform.get_msgs(2):
-                entries, result = gamesync_transform(entries, field_transform, globals_, now)
-                results.append(result)
-            staging.put(name, updated_document(doc, now, entries))
-            return encode((2, encode(*[(1, result) for result in results])))  # TransformResult
-
-        if (delete := op.get_msg(4)) is not None:
-            name = self.resolve(call, delete.get_str(1))
+            entries = doc_entries(doc, work)
+            # Each FieldTransform is parsed as it is applied and let go after it, so the request
+            # budgets (request_budget) hold one at a time, not all of them at once.
+            values = [gamesync_transform(entries, Msg(field_transform), globals_, now, work)
+                      for field_transform in transform.get_raws(2)]
+            if self.relay is not None:  # a result may copy what another player wrote (load_global_value)
+                values = [self.relay.value(value) for value in values]
+            result = encode((2, encode(*[(1, value) for value in values])))  # TransformResult
+        elif (delete := op.get_msg(4)) is not None:
+            name = aliases.expand(delete.get_str(1))
             check_precondition(name, staging.get(name), delete.get_msg(2))
+            work.spend(STATE_OVERHEAD_BYTES)
             staging.put(name, None)
             return encode((3, b""))  # DeleteResult
-
-        raise GrpcError(INVALID_ARGUMENT, "empty write operation")
+        else:
+            raise GrpcError(INVALID_ARGUMENT, "empty write operation")
+        work.spend(STATE_OVERHEAD_BYTES + stored_fields_size(entries))
+        staged = updated_document(doc, now, entries)
+        staging.put(name, staged)
+        return result
 
     def gamesync_notify(self, space: GamesyncSpace, changes: dict[str, dict | None], created: set[str]) -> None:
+        """Sends the changes to the watchers whose targets cover them, each document encoded once.
+        In relay-only mode one that cannot be filtered (RelayOnly) within the request budgets is sent
+        to nobody: the commit is already applied, so the calls of the watchers it was for end
+        (RESOURCE_EXHAUSTED) instead."""
+        documents: dict[str, bytes | GrpcError] = {}
         for watcher in space.watchers:
             for name, doc in changes.items():
                 for target_id in watcher.targets:
@@ -2814,8 +3536,18 @@ class Backend:
                         change = encode((1, wire_target_id(target_id)), (2, DOCUMENT_CHANGE_DELETED),
                                         (3, encode((1, name))))
                     else:
+                        if name not in documents:
+                            try:
+                                documents[name] = encode_document(name, doc, relay=self.relay)
+                            except GrpcError as exc:
+                                log.warning("gamesync %s not delivered: %s", name, exc.message)
+                                documents[name] = exc
+                        document = documents[name]
+                        if isinstance(document, GrpcError):
+                            watcher.end(GrpcError(document.code, document.message))
+                            continue
                         kind = DOCUMENT_CHANGE_EXIST if name in created else DOCUMENT_CHANGE_UPDATED
-                        change = encode((1, wire_target_id(target_id)), (2, kind), (3, encode_document(name, doc)))
+                        change = encode((1, wire_target_id(target_id)), (2, kind), (3, document))
                     watcher.send(encode((2, change)))
 
     def gamesync_watch(self, call: Call, watcher: GamesyncWatcher, target: Msg) -> None:
@@ -2836,7 +3568,7 @@ class Backend:
         watcher.send(encode((3, encode((1, wire_id), (2, TARGET_CHANGE_UPDATED)))))
         covered = [name for name in sorted(docs) if watcher.covers(target_id, name)]
         for name in covered:
-            document = encode_document(name, docs[name])
+            document = encode_document(name, docs[name], relay=self.relay)
             change = encode((1, wire_id), (2, DOCUMENT_CHANGE_EXIST), (3, document))
             watcher.send(encode((2, change)))
         watcher.send(encode((3, encode((1, wire_id), (2, TARGET_CHANGE_LISTED)))))
@@ -2887,35 +3619,88 @@ class Backend:
         entries.setdefault("tn", encode((7, definition.get_str(4))))
         space.docs[name] = updated_document(doc, now, entries)
         self.gamesync_notify(space, {name: space.docs[name]}, set() if doc else {name})
-        log.info("gamesync %s %s for %s: uid=%s ussid=%d ucsid=%d", "refreshed" if doc else "created",
-                 name, session.name, Msg(entries["uid"]).get_str(7) or "-",
-                 Msg(entries["ussid"]).get_int(3), Msg(entries["ucsid"]).get_int(3))
+        log.info("gamesync %s %s for %s: %s", "refreshed" if doc else "created", name, session.name,
+                 describe_user_session_document(entries))
 
-    def gamesync_fire_deferments(self, space: GamesyncSpace, user_session: str) -> None:
-        """Applies the deferred writes of a user session whose KeepUserSession call ended or that
-        left its game session, one deferment and one write at a time.
+    def gamesync_fire_deferments(self, session: GameSession, user_session: str, left: bool = False) -> None:
+        """Queues the deferred writes of user session `user_session`, whose KeepUserSession call
+        ended or that `left` the game session, to be applied in the order their names were first
+        stored, and after them, when it left, the deletion of the gamesync documents named after it
+        (GamesyncSpace.queue), which happens even if they fail. The deferments are taken out of the
+        game session's deferments now, so later DefermentOperations no longer reach them, but they
+        count against its Gamesync limit until they are applied.
 
-        They were admitted against the game session's Gamesync limit when they were stored, so
-        they are parsed outside the request budget of whichever call this runs in
-        (request_budget): request data that other calls hold, or that the ending call holds, must
-        not cost the game session writes it already accepted. That parsing is still bounded: a
-        deferment came in one gRPC message (MAX_GRPC_MESSAGE_BYTES), and the deferments are applied
-        without yielding, so no other one is parsed meanwhile. A deferment whose writes fail on
-        their own (malformed or empty, a failed precondition, the Gamesync limit) is logged and
-        dropped: its user session may be gone, so nothing would try it again."""
-        token = request_budget.set(None)
-        try:
-            for name, (owner, call, deferment) in list(space.deferments.items()):
-                if owner != user_session:
-                    continue
+        In the event loop, a task of the game session works through the queue one entry per turn
+        of the loop (gamesync_apply_queue), so other calls wait for at most one deferment at a time,
+        and each deferment is a commit of its own, with its own GamesyncWork and ParseBudget: what
+        one copies or parses never costs another. Without a running event loop (tests, tools),
+        nothing else runs meanwhile, so the queue is worked through at once."""
+        space = session.gamesync
+        for name, (owner, aliases, deferment) in list(space.deferments.items()):
+            if owner == user_session:
                 del space.deferments[name]
+                space.queue.append(QueuedDeferment(name, owner, aliases, deferment))
+        if left:
+            space.queue.append(QueuedDeparture(user_session))
+        if not space.queue:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no event loop runs in this thread
+            while space.queue:
+                self.gamesync_apply_queued(session)
+            return
+        if space.applier is None or space.applier.done():  # done: cancelled before it ever ran
+            space.applier = loop.create_task(self.gamesync_apply_queue(session))
+
+    async def gamesync_apply_queue(self, session: GameSession) -> None:
+        """Works through a game session's queue (GamesyncSpace.queue), one entry per turn of the
+        event loop, until it is empty."""
+        space = session.gamesync
+        request_budget.set(None)  # inherited from the call that started this task, which is not its own
+        try:
+            while space.queue:
                 try:
-                    writes = (Msg(write) for write in Msg(deferment).get_raws(2))
-                    self.gamesync_commit(space, owner, call, writes, [])
-                except (GrpcError, ValueError) as exc:
-                    log.warning("deferment %s of %s failed: %s", name, user_session, exc)
-                else:
-                    log.info("applied deferment %s of %s", name, user_session)
+                    self.gamesync_apply_queued(session)
+                except Exception:  # no caller to report it to; the entries after it still apply
+                    log.exception("the gamesync queue of %s failed", session.name)
+                await asyncio.sleep(0)
+        finally:
+            space.applier = None
+
+    def gamesync_apply_queued(self, session: GameSession) -> None:
+        """Takes the first entry of a game session's queue (GamesyncSpace.queue) and does it:
+        deletes the gamesync documents named after a user session that left, or applies a
+        deferment as a commit of its own. A deferment's names resolve with the aliases kept when it
+        was stored (gamesync_commit), so the tokens of the call that stored it may have expired
+        since. Nothing is done to a game session that has been dropped (drop_user_session).
+
+        Deferments were admitted against the game session's Gamesync limit when they were stored,
+        so request data that other calls hold, or that the call that queued them holds, must not
+        cost the game session writes it already accepted: a deferment is parsed within a
+        ParseBudget of its own (MAX_DEFERMENT_PARSE_BYTES), not a request budget (request_budget).
+        One that fails in any way (malformed or empty, a failed precondition, the Gamesync limit,
+        its GamesyncWork or ParseBudget spent) is logged and dropped with none of its writes
+        applied: its user session may be gone, so nothing would try it again."""
+        space = session.gamesync
+        entry = space.queue.popleft()
+        if self.sessions.get(session.name) is not session:
+            space.queue.clear()
+            return
+        token = request_budget.set(ParseBudget(MAX_DEFERMENT_PARSE_BYTES))
+        try:
+            if isinstance(entry, QueuedDeparture):
+                session_id = entry.user_session.rpartition("/")[2]
+                self.gamesync_delete(space, [name for name in space.docs if name.rpartition("/")[2] == session_id])
+                return
+            try:
+                deferred = Msg(entry.deferment)  # held while its writes are applied, so it counts meanwhile
+                writes = (Msg(write) for write in deferred.get_raws(2))
+                self.gamesync_commit(space, entry.owner, entry.aliases, writes, [])
+            except Exception as exc:  # stored client data: whatever it raises, the rest still apply
+                log.warning("deferment %s of %s failed: %s", entry.name, entry.owner, exc)
+            else:
+                log.info("applied deferment %s of %s", entry.name, entry.owner)
         finally:
             request_budget.reset(token)
 
@@ -2937,6 +3722,8 @@ class Backend:
                 async for req in requests:
                     if watcher.error is not None:
                         return  # the server ended the call
+                    if session.user_sessions.get(member.user) is not member:
+                        raise GrpcError(NOT_FOUND, f"{member.name} has left its game session")
                     log.info("KeepUserSession %s <- %s", member.name, describe_keep_user_session_request(req))
                     if named := self.resolve(call, req.get_str(1)):
                         found = self.gamesync_member(member.user, named)
@@ -2981,7 +3768,7 @@ class Backend:
             space.watchers.discard(watcher)
             log.info("KeepUserSession %s ended (%s) after %d response(s); targets: %s",
                      member.name, reason, sent, ", ".join(watcher.targets) or "-")
-            self.gamesync_fire_deferments(space, member.name)
+            self.gamesync_fire_deferments(session, member.name)
             member.last_seen = time.time_ns()
 
     # Subscriptions the game keeps open; nothing is ever announced on them.
@@ -2995,6 +3782,209 @@ class Backend:
         while True:
             yield encode((3, duration(KEEP_ALIVE_SECONDS)))  # keep_alive_interval, no friends
             await asyncio.sleep(KEEP_ALIVE_SECONDS)
+
+
+# --- Live campaign events (HTTP) --------------------------------------------------------------
+
+
+def is_campaign_live(target: str) -> bool:
+    """Whether an HTTP request target names /campaign/live (CampaignLive) instead of storage."""
+    try:
+        return urlsplit(target).path == CAMPAIGN_LIVE_PATH
+    except ValueError:  # left to Storage.handle, as before
+        return False
+
+
+def live_response(status: int, payload: dict, headers: list[tuple[str, str]] | None = None) -> Response:
+    return response(status, json.dumps(payload, separators=(",", ":")).encode(), "application/json",
+                    [("cache-control", "no-store"), *(headers or [])])
+
+
+def unique_json_keys(pairs: list[tuple[str, object]]) -> dict:
+    """json.loads object_pairs_hook: an object that names a key twice is refused, not trimmed."""
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("an object names a key twice")
+    return result
+
+
+def no_json_constant(name: str) -> object:
+    """json.loads parse_constant: NaN and the infinities are refused."""
+    raise ValueError(f"{name} is not a number")
+
+
+def check_live_session(session: object) -> str:
+    if not (isinstance(session, str) and 0 < len(session) <= MAX_NAME_BYTES
+            and session.isascii() and session.isprintable()):
+        raise LiveError(400, "bad_request", "session is the name of a game session")
+    return session
+
+
+def check_live_epoch(epoch: object) -> str:
+    if not (isinstance(epoch, str) and ID_PATTERN.fullmatch(epoch)):
+        raise LiveError(400, "bad_request", "epoch is the epoch a GET answered with")
+    return epoch
+
+
+def parse_live_query(query: str) -> tuple[str, str, int]:
+    """The session, epoch and cursor (`after`) of a poll, each given once and nothing else."""
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True, errors="strict",
+                          max_num_fields=3)
+    except ValueError:
+        pairs = []
+    fields = dict(pairs)
+    if len(fields) != len(pairs) or fields.keys() != {"session", "epoch", "after"}:
+        raise LiveError(400, "bad_request", "a poll's query holds session, epoch and after, once each")
+    if not re.fullmatch(r"0|[1-9][0-9]{0,17}", fields["after"]):
+        raise LiveError(400, "bad_request", "after is a sequence number, 0 before the first event")
+    return check_live_session(fields["session"]), check_live_epoch(fields["epoch"]), int(fields["after"])
+
+
+def parse_live_event(event: object) -> tuple[int, int, int]:
+    """(quest id, old state, new state) of one posted event."""
+    if not isinstance(event, dict) or event.keys() != {"id", "old", "new"}:
+        raise LiveError(400, "bad_request", "an event is an object of id, old and new")
+    quest, old, new = event["id"], event["old"], event["new"]
+    if not (type(quest) is int and 1 <= quest <= MAX_QUEST_ID):
+        raise LiveError(400, "bad_request", f"an event's id is a quest id from 1 to {MAX_QUEST_ID}")
+    if not all(type(state) is int and 1 <= state <= MAX_QUEST_STATE for state in (old, new)) or old == new:
+        raise LiveError(400, "bad_request",
+                        f"an event's old and new are two different states from 1 to {MAX_QUEST_STATE}")
+    return quest, old, new
+
+
+def parse_live_post(body: bytes) -> tuple[str, str, int, list[tuple[int, int, int]]]:
+    """The session, epoch, first sequence number and events of a POST's JSON body. Integers are
+    JSON integers: booleans and fractions are refused, as are keys beyond the contract's."""
+    if len(body) > MAX_LIVE_REQUEST_BYTES:
+        raise LiveError(413, "too_large", f"a POST's body has at most {MAX_LIVE_REQUEST_BYTES} bytes")
+    try:
+        value = json.loads(body.decode(), object_pairs_hook=unique_json_keys, parse_constant=no_json_constant)
+    except (ValueError, RecursionError) as exc:
+        raise LiveError(400, "bad_request", f"the body is not JSON: {exc}") from None
+    if not isinstance(value, dict) or value.keys() != {"session", "epoch", "first", "events"}:
+        raise LiveError(400, "bad_request", "the body is an object of session, epoch, first and events")
+    first, events = value["first"], value["events"]
+    if type(first) is not int or first < 1:
+        raise LiveError(400, "bad_request", "first is the sequence number of the first event, from 1")
+    if not isinstance(events, list) or not events:
+        raise LiveError(400, "bad_request", "events is a list of at least one event")
+    if len(events) > MAX_LIVE_BATCH:
+        raise LiveError(413, "too_large", f"a POST carries at most {MAX_LIVE_BATCH} events")
+    return (check_live_session(value["session"]), check_live_epoch(value["epoch"]), first,
+            [parse_live_event(event) for event in events])
+
+
+class CampaignLive:
+    """/campaign/live over HTTP/1.1 or HTTP/2: the live quest events of story co-op game sessions
+    (LiveJournal). Every request is authorized by the account behind its connection, so only
+    client-certificate mode serves them; local mode, which authenticates nobody, refuses them all.
+
+    GET without a query finds the one live game session with an active user of the caller's account
+    in it (none or several fail) and answers its name, its journal's epoch and bounds, and the
+    caller's role: "host" if the session's creator is in it and belongs to the caller's account,
+    else "guest". GET ?session=&epoch=&after= also answers the events after sequence number `after`.
+    POST {session, epoch, first, events} adds events, from the creator's account only, while the
+    creator is in the session. A session without an active user of the caller's account looks
+    missing. Neither the quest state a game session starts with nor durable stage checkpoints are
+    served here: this only carries what the host posts while its guests listen."""
+
+    def __init__(self, backend: Backend):
+        self.backend = backend
+
+    def handle(self, method: str, target: str, headers: dict[str, str], body: bytes,
+               principal: Principal | None) -> Response:
+        try:
+            result, outcome = self.serve(method, target, headers, body, principal), "ok"
+        except LiveError as exc:
+            allow = [("allow", "GET, POST")] if exc.status == 405 else []
+            result = live_response(exc.status, {"error": exc.code, "message": exc.message, **exc.bounds}, allow)
+            outcome = exc.code
+        log.info("campaign live %s from account %s -> %d %s", method,
+                 principal.account if principal is not None else "-", result.status, outcome)
+        return result
+
+    def serve(self, method: str, target: str, headers: dict[str, str], body: bytes,
+              principal: Principal | None) -> Response:
+        if principal is None:
+            raise LiveError(401, "unauthenticated", "live campaign events need a device certificate")
+        if method not in ("GET", "POST"):
+            raise LiveError(405, "method_not_allowed", f"{CAMPAIGN_LIVE_PATH} takes GET and POST")
+        call = Call(CAMPAIGN_LIVE_PATH, {}, principal)
+        query = urlsplit(target).query
+        self.backend.prune_sessions()
+        if method == "GET":
+            if body:
+                raise LiveError(400, "bad_request", "a GET has no body")
+            if not query:
+                session = self.discover(call)
+                return self.state(call, session, self.journal(session), [])
+            name, epoch, after = parse_live_query(query)
+            session = self.member_session(call, name)
+            journal = self.current(session, epoch)
+            return self.state(call, session, journal, journal.since(after))
+        if query:
+            raise LiveError(400, "bad_request", "a POST has no query")
+        if headers.get("content-type", "").partition(";")[0].strip().lower() != "application/json":
+            raise LiveError(415, "unsupported_media_type", "a POST's body is application/json")
+        name, epoch, first, events = parse_live_post(body)
+        session = self.member_session(call, name)
+        if not self.hosts(call, session):
+            raise LiveError(403, "not_host", "only the game session's creator posts quest events, while in it")
+        journal = self.current(session, epoch)
+        journal.append(first, events)
+        log.info("live quest events %d-%d posted to %s, whose journal ends at %d", first,
+                 first + len(events) - 1, session.name, journal.last)
+        return self.state(call, session, journal)
+
+    def member(self, call: Call, session: GameSession) -> bool:
+        """Whether an active user of the caller's account is in `session` (after prune_sessions)."""
+        return any(self.backend.owns(call, user) for user in session.user_sessions)
+
+    def hosts(self, call: Call, session: GameSession) -> bool:
+        """Whether the session's creator is in it and belongs to the caller's account."""
+        return session.creator in session.user_sessions and self.backend.owns(call, session.creator)
+
+    def discover(self, call: Call) -> GameSession:
+        found = [session for session in self.backend.sessions.values() if self.member(call, session)]
+        if not found:
+            raise LiveError(404, "no_session", "no user of this account is in a live game session")
+        if len(found) > 1:
+            raise LiveError(404, "ambiguous_session", f"users of this account are in {len(found)} game sessions")
+        return found[0]
+
+    def member_session(self, call: Call, name: str) -> GameSession:
+        session = self.backend.sessions.get(name)
+        if session is None or not self.member(call, session):
+            raise LiveError(404, "session_gone", "no user of this account is in that live game session")
+        return session
+
+    @staticmethod
+    def journal(session: GameSession) -> LiveJournal:
+        """The session's journal; a new one, with a new epoch, once its creator plays in it under
+        another user session than the journal started with."""
+        creator = session.user_sessions.get(session.creator)
+        host = creator.name if creator is not None else ""
+        if session.live is None or (host and host != session.live.host):
+            session.live = LiveJournal(host)
+            log.info("live quest events of %s start epoch %s", session.name, session.live.epoch)
+        return session.live
+
+    def current(self, session: GameSession, epoch: str) -> LiveJournal:
+        journal = self.journal(session)
+        if epoch != journal.epoch:
+            raise LiveError(409, "stale_epoch", "the session's quest events started over in another epoch")
+        return journal
+
+    def state(self, call: Call, session: GameSession, journal: LiveJournal,
+              events: list[dict[str, int]] | None = None) -> Response:
+        payload = {"session": session.name, "epoch": journal.epoch,
+                   "role": "host" if self.hosts(call, session) else "guest",
+                   "first": journal.first, "last": journal.last}
+        if events is not None:
+            payload["events"] = events
+        return live_response(200, payload)
 
 
 # --- gRPC over HTTP/2 -------------------------------------------------------------------------
@@ -3415,12 +4405,14 @@ class H2Session:
                 await self.server.handle_grpc(H2Stream(self, stream_id), headers, body)
                 return
             method = headers.get(":method", "")
-            if method in ("GET", "HEAD") and (self.downloads >= MAX_DOWNLOADS_PER_CONNECTION
-                                              or self.server.downloads >= MAX_DOWNLOADS):
+            target = headers.get(":path", "")
+            if is_campaign_live(target):
+                result = self.server.campaign.handle(method, target, headers, body, self.principal)
+            elif method in ("GET", "HEAD") and (self.downloads >= MAX_DOWNLOADS_PER_CONNECTION
+                                                or self.server.downloads >= MAX_DOWNLOADS):
                 result = response(503, b"too many downloads at once\n")
             else:
-                result = self.server.storage.handle(method, headers.get(":path", ""), headers, body,
-                                                    self.principal)
+                result = self.server.storage.handle(method, target, headers, body, self.principal)
             if result.stream is not None:
                 await self.send_file(stream_id, result, method == "HEAD")
                 return
@@ -3439,7 +4431,7 @@ class H2Session:
                     self.reset(stream_id, h2.errors.ErrorCodes.NO_ERROR)
 
 
-# --- HTTP/1.1 (island storage only) ------------------------------------------------------------
+# --- HTTP/1.1 (island storage and live campaign events only) ----------------------------------
 
 
 async def drain(writer: asyncio.StreamWriter) -> None:
@@ -3523,11 +4515,13 @@ async def serve_http1(server: Server, reader: asyncio.StreamReader, writer: asyn
             data, body = bytes(body), bytearray()
             method = request.method.decode("ascii")
             headers = {name.decode("latin-1"): value.decode("latin-1") for name, value in request.headers}
-            if method in ("GET", "HEAD") and server.downloads >= MAX_DOWNLOADS:
+            target = request.target.decode("latin-1")
+            if is_campaign_live(target):
+                result = server.campaign.handle(method, target, headers, data, principal)
+            elif method in ("GET", "HEAD") and server.downloads >= MAX_DOWNLOADS:
                 result = response(503, b"too many downloads at once\n")
             else:
-                result = server.storage.handle(method, request.target.decode("latin-1"), headers, data,
-                                               principal)
+                result = server.storage.handle(method, target, headers, data, principal)
             del data
             if result.stream is not None:
                 await send_file_http1(server, conn, writer, result, method == "HEAD")
@@ -3799,12 +4793,13 @@ def raise_open_file_limit() -> None:
 
 
 class Server:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, turn: TurnServer | None = None, relay: RelayOnly | None = None):
         self.store = Store(args.data_dir)
         self.storage = Storage(self.store, args.storage_url.rstrip("/"))
         self.storage.max_bytes = args.max_storage_mb * 1024 * 1024
         self.backend = Backend(self.store, self.storage, args.max_players, advertised_stun(args),
-                               args.gamesync_port or (args.port or DEFAULT_TLS_PORTS)[0])
+                               args.gamesync_port or (args.port or DEFAULT_TLS_PORTS)[0], turn, relay)
+        self.campaign = CampaignLive(self.backend)  # /campaign/live
         # Client-certificate mode: whose each device certificate is. None in local mode.
         self.auth = AuthRegistry(args.auth_db) if args.client_ca else None
         self.connections: dict[str, int] = {}  # open connections per account
@@ -3860,7 +4855,10 @@ class Server:
                 response_payload = handler(call, request) if handler else b""
                 del request  # not held while the response waits for the client
                 if log.isEnabledFor(logging.DEBUG):
-                    log.debug("response:\n%s", dump(response_payload, 1))
+                    if path == GAME_SESSIONS + "AllocateIceServerSet":  # may hold a TURN password
+                        log.debug("response: <%d bytes, ICE server set not dumped>", len(response_payload))
+                    else:
+                        log.debug("response:\n%s", dump(response_payload, 1))
                 await stream.send_message(response_payload)
             stream.finish(OK)
         except GrpcError as exc:
@@ -3962,8 +4960,8 @@ def tls_context(cert: Path, key: Path, client_ca: Path | None = None) -> ssl.SSL
     return context
 
 
-async def serve(args: argparse.Namespace) -> None:
-    server = Server(args)
+async def serve(args: argparse.Namespace, turn: TurnServer | None = None, relay: RelayOnly | None = None) -> None:
+    server = Server(args, turn, relay)
     context = tls_context(args.cert, args.key, args.client_ca)
     purger = None  # holds the purge task, which the event loop only references weakly
     if server.auth is not None:
@@ -3987,10 +4985,51 @@ async def serve(args: argparse.Namespace) -> None:
         os.chmod(args.snapshot_socket, 0o600)
         log.info("backup snapshots on %s", args.snapshot_socket)
     log.info("AllocateIceServerSet hands out STUN server %s", server.backend.stun or "(none)")
+    if turn is not None:
+        log.info("AllocateIceServerSet hands out TURN server %s:%d (UDP) with credentials for %d s",
+                 turn.host, turn.port, TURN_CREDENTIAL_SECONDS)
+    if relay is not None:
+        log.info("relay-only: gamesync session descriptions are delivered with only relay candidates at "
+                 "%s ports %d-%d", relay.address, *relay.ports)
     log.info("upload/download URIs use %s; data in %s", server.storage.base_url, args.data_dir)
     # Short sleeps keep Ctrl+C responsive on Windows.
     while True:
         await asyncio.sleep(1)
+
+
+def turn_settings(args: argparse.Namespace) -> tuple[TurnServer | None, RelayOnly | None]:
+    """The TURN server (--turn, --turn-secret-file) and relay-only delivery (--relay-only,
+    --turn-relay-ports) the options ask for; ValueError says what is wrong with them."""
+    if (args.turn is None) != (args.turn_secret_file is None):
+        raise ValueError("--turn and --turn-secret-file go together")
+    if args.relay_only != (args.turn_relay_ports is not None):
+        raise ValueError("--relay-only and --turn-relay-ports go together")
+    if args.turn is None:
+        if args.relay_only:
+            raise ValueError("--relay-only needs --turn")
+        return None, None
+    host, _, port = args.turn.rpartition(":")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError("--turn must be host:port")
+    try:
+        secret = args.turn_secret_file.read_bytes().strip()
+    except OSError as exc:
+        raise ValueError(f"--turn-secret-file: {exc}") from None
+    # The secret is coturn's static-auth-secret, written as one word in turnserver.conf.
+    if len(secret) < MIN_TURN_SECRET_BYTES or not re.fullmatch(rb"[\x21-\x7e]+", secret):
+        raise ValueError(f"--turn-secret-file must hold one line of at least {MIN_TURN_SECRET_BYTES} "
+                         "printable ASCII characters without spaces, e.g. from openssl rand -hex 32")
+    if not args.relay_only:
+        return TurnServer(host, int(port), secret), None
+    try:
+        address = str(ipaddress.IPv4Address(host))
+    except ValueError:
+        raise ValueError("--relay-only needs --turn as IPv4-address:port: relay candidates must name "
+                         "that address") from None
+    low, _, high = args.turn_relay_ports.partition(":")
+    if not (low.isdigit() and high.isdigit() and 0 < int(low) <= int(high) < 65536):
+        raise ValueError("--turn-relay-ports must be MIN:MAX, the TURN server's relay port range")
+    return TurnServer(address, int(port), secret), RelayOnly(address, (int(low), int(high)))
 
 
 def main() -> None:
@@ -4026,6 +5065,20 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true", help="dump message payloads")
     parser.add_argument("--snapshot-socket", type=Path,
                         help="serve backup snapshots to root and this user on this Unix socket (Linux)")
+    parser.add_argument("--turn", metavar="HOST:PORT",
+                        help="TURN server (UDP) handed out by AllocateIceServerSet with credentials "
+                             "that expire with the ICE server set (coturn use-auth-secret); needs "
+                             "--turn-secret-file")
+    parser.add_argument("--turn-secret-file", type=Path,
+                        help="file holding the TURN server's static-auth-secret, kept off the command "
+                             "line so the process list does not show it")
+    parser.add_argument("--relay-only", action="store_true",
+                        help="deliver gamesync session descriptions with only relay candidates on the "
+                             "--turn server and no player's own address; needs --turn as an IPv4 "
+                             "address and --turn-relay-ports")
+    parser.add_argument("--turn-relay-ports", metavar="MIN:MAX",
+                        help="the TURN server's relay port range (coturn min-port:max-port), the only "
+                             "ports --relay-only lets relay candidates name")
     args = parser.parse_args()
     if args.snapshot_socket and not hasattr(socket, "SO_PEERCRED"):
         parser.error("--snapshot-socket needs Linux")
@@ -4047,6 +5100,10 @@ def main() -> None:
                      "for a trusted LAN")
     if args.max_storage_mb <= 0:
         parser.error("--max-storage-mb must be positive")
+    try:
+        turn, relay = turn_settings(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     if os.name == "posix":
         os.umask(0o077)  # state.json, blobs and temporary files are secret (see Store)
 
@@ -4055,7 +5112,7 @@ def main() -> None:
     for noisy in ("asyncio", "hpack", "h2"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     try:
-        asyncio.run(serve(args))
+        asyncio.run(serve(args, turn, relay))
     except KeyboardInterrupt:
         pass
 

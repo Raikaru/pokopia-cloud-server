@@ -49,6 +49,11 @@ def update(name: str, fields: dict[str, bytes]) -> bytes:
     return encode((1, encode((1, encode((1, name), (2, server.encode_map(fields)))))))
 
 
+def island_context(password: str) -> bytes:
+    """The rule context the game commits a Cloud Island save with: the island's sessionID and password."""
+    return server.encode_map({"sessionID": text(SESSION_ID[1:]), "password": text(password)})
+
+
 class Account:
     """One portal account with one emulator profile and its NPLN user."""
 
@@ -69,8 +74,9 @@ class Account:
             metadata["authorization"] = f"Bearer {token}"
         return server.Call("", metadata, self.principal, self.network)
 
-    def commit(self, *operations: bytes) -> bytes:
-        return self.backend.commit_documents(self.call(), Msg(encode(*[(2, op) for op in operations])))
+    def commit(self, *operations: bytes, context: bytes | None = None) -> bytes:
+        return self.backend.commit_documents(
+            self.call(), Msg(encode(*[(2, op) for op in operations], (3, context))))
 
     def get(self, name: str, password: str | None = None) -> Msg:
         context = server.encode_map({"password": text(password)}) if password is not None else None
@@ -110,9 +116,9 @@ class ClientAuthTest(unittest.TestCase):
             update(f"{self.host.documents}/private/StageData", {}),
         )
 
-    def assert_status(self, code: int, function, *args) -> None:
+    def assert_status(self, code: int, function, *args, **kwargs) -> None:
         with self.assertRaises(server.GrpcError) as raised:
-            function(*args)
+            function(*args, **kwargs)
         self.assertEqual(raised.exception.code, code, raised.exception.message)
 
     # Identity
@@ -145,6 +151,19 @@ class ClientAuthTest(unittest.TestCase):
         self.assert_status(server.PERMISSION_DENIED, self.backend.issue_attachment_uri, self.guest.call(),
                            Msg(encode((1, f"{self.host.documents}/private/StageData"))))
 
+    def test_masked_deletion_keeps_unrelated_fields(self) -> None:
+        # A masked path the update leaves out is deleted where it is; a field above it that is
+        # missing or holds no map is kept as it is.
+        name = f"{self.host.documents}/public/MetaData"
+        pair = encode((10, server.encode_map({"b": text("gone"), "c": text("kept")})))
+        self.host.commit(update(name, {"owner": text("host"), "m": pair}))
+        mask = encode((1, "owner.b"), (1, "m.b"), (1, "n.b"))
+        self.host.commit(encode((1, encode((1, encode((1, name))), (2, mask)))))
+        fields = server.map_entries(self.host.get(name).get_bytes(2))
+        self.assertEqual(fields["owner"], text("host"))
+        self.assertEqual(server.map_entries(Msg(fields["m"]).get_bytes(10)), {"c": text("kept")})
+        self.assertNotIn("n", fields)
+
     def test_island_password_opens_session_id_then_stage_data(self) -> None:
         stage = f"{self.host.documents}/private/StageData"
         self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
@@ -152,6 +171,41 @@ class ClientAuthTest(unittest.TestCase):
                            f"{self.host.documents}/private/SessionIDData", "WRONG0")
         self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
         self.assertEqual(self.guest.get(stage).get_str(1), stage)
+
+    def test_island_attachment_requires_current_password_grant(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        upload_id = self.complete_upload()
+        self.host.commit(encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{upload_id}")))))
+        request = Msg(encode((1, stage)))
+        self.assert_status(server.PERMISSION_DENIED, self.backend.issue_attachment_uri, self.guest.call(), request)
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        url = Msg(self.backend.issue_attachment_uri(self.guest.call(), request)).get_str(1)
+        path = "/" + url.split("/", 3)[3]
+        result = self.storage.handle("GET", path, {}, b"", self.guest.principal)
+        self.assertEqual(result.status, 200)
+        file, start, length = result.stream
+        try:
+            file.seek(start)
+            self.assertEqual(file.read(length), b"island")
+        finally:
+            file.close()
+        other = Account(self.backend, "acct-other", "192.0.2.1")
+        self.assertEqual(self.storage.handle("GET", path, {}, b"", other.principal).status, 404)
+        extra = f"{self.host.documents}/private/Extra"
+        extra_upload = self.complete_upload()
+        self.host.commit(encode((5, encode((1, extra), (2, f"https://storage.invalid/upload/{extra_upload}")))))
+        self.assert_status(server.PERMISSION_DENIED, self.backend.issue_attachment_uri, self.guest.call(),
+                           Msg(encode((1, extra))))
+        extra_url = Msg(self.backend.issue_attachment_uri(self.host.call(), Msg(encode((1, extra))))).get_str(1)
+        self.assertEqual(self.storage.handle("GET", "/" + extra_url.split("/", 3)[3], {}, b"",
+                                             self.guest.principal).status, 404)
+        with mock.patch.object(server.time, "monotonic", return_value=float("inf")):
+            self.assert_status(server.PERMISSION_DENIED, self.backend.issue_attachment_uri, self.guest.call(), request)
+            self.assertEqual(self.storage.handle("GET", path, {}, b"", self.guest.principal).status, 404)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}))
+        self.host.commit(update(f"{self.host.documents}/private/PasswordData", {"password": text("NEW123")}))
+        self.assert_status(server.PERMISSION_DENIED, self.backend.issue_attachment_uri, self.guest.call(), request)
+        self.assertEqual(self.storage.handle("GET", path, {}, b"", self.guest.principal).status, 404)
 
     def test_wrong_passwords_are_limited_per_account(self) -> None:
         session_id_data = f"{self.host.documents}/private/SessionIDData"
@@ -465,6 +519,153 @@ class ClientAuthTest(unittest.TestCase):
         request = encode((1, session.name), (2, PASSWORD), (3, encode((1, self.host.user))))
         self.assert_status(server.PERMISSION_DENIED, self.backend.join_game_session,
                            self.guest.call(), Msg(request))
+
+    # Cloud Island hosting by others than the owner
+
+    @staticmethod
+    def grant_expired() -> float:
+        """A monotonic time at which every password grant given so far has ended."""
+        return server.time.monotonic() + server.PASSWORD_GRANT_SECONDS + 1
+
+    def join_island(self) -> server.GameSession:
+        """The owner's island session, which the guest joined with the island password."""
+        session = self.host.host()
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.guest.join(session, PASSWORD)
+        return session
+
+    def guest_upload(self, body: bytes = b"saved by the guest") -> str:
+        upload_id = self.storage.new_upload(self.guest.principal.account)
+        self.storage.handle("PUT", f"/upload/{upload_id}", {}, body, self.guest.principal)
+        return upload_id
+
+    def island_save(self, upload_id: str) -> tuple[bytes, bytes, bytes]:
+        """The writes of the game's Cloud Island save, as its host commits them."""
+        stage = f"{self.host.documents}/private/StageData"
+        return (update(stage, {}),
+                encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{upload_id}")))),
+                update(f"{self.host.documents}/public/MetaData", {"ownerPlayerName": text("host")}))
+
+    def download_stage(self, account: Account) -> bytes:
+        request = Msg(encode((1, f"{self.host.documents}/private/StageData")))
+        url = Msg(self.backend.issue_attachment_uri(account.call(), request)).get_str(1)
+        result = self.storage.handle("GET", "/" + url.split("/", 3)[3], {}, b"", account.principal)
+        self.assertEqual(result.status, 200)
+        file, start, length = result.stream
+        try:
+            file.seek(start)
+            return file.read(length)
+        finally:
+            file.close()
+
+    def test_host_the_owner_handed_over_to_saves_the_island(self) -> None:
+        # The owner leaves its island to the guest, who hosts it from then on, maybe longer after
+        # joining than a password grant lasts: it reads the island and saves it for the owner.
+        stage = f"{self.host.documents}/private/StageData"
+        self.host.commit(encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{self.complete_upload()}")))))
+        session = self.join_island()
+        self.backend.drop_user_session(session, self.host.user)  # the owner has left
+        self.assertEqual(list(session.user_sessions), [self.guest.user])
+        self.assertIs(self.backend.sessions[session.name], session)
+        self.assertEqual(session.island, self.host.user)
+        upload_id = self.guest_upload()
+        blob = self.store.uploads[upload_id]["blob"]
+        with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
+            self.assertEqual(self.guest.get(stage).get_str(1), stage)
+            self.assertEqual(self.download_stage(self.guest), b"island")
+            with self.assertLogs(server.log, "INFO") as logs:
+                self.guest.commit(*self.island_save(upload_id), context=island_context(PASSWORD))
+        self.assertTrue(any("saves the island" in line for line in logs.output))
+        self.assertEqual(self.store.documents[stage]["attachment"]["blob"], blob)
+        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
+        metadata = server.map_entries(self.host.get(f"{self.host.documents}/public/MetaData").get_bytes(2))
+        self.assertEqual(metadata["ownerPlayerName"], text("host"))
+
+    def test_visitor_hosts_and_saves_the_island_while_the_owner_is_away(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        self.host.commit(encode((2, encode((1, stage)))))  # the owner left before saving it once
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assertEqual(self.guest.query(), [])
+        session = self.guest.host()
+        self.assertEqual(session.island, self.host.user)
+        # Other visitors with the password, and the owner, find the session the visitor opened.
+        other = Account(self.backend, "acct-other", "192.0.2.1")
+        self.assertEqual(other.query(), [])
+        other.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assertEqual([entry.get_str(1) for entry in other.query()], [session.name])
+        other.join(session, PASSWORD)
+        self.assertEqual([entry.get_str(1) for entry in self.host.query()], [session.name])
+        upload_id = self.guest_upload()
+        with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
+            self.guest.commit(*self.island_save(upload_id), context=island_context(PASSWORD))
+            self.assertEqual(self.download_stage(other), b"saved by the guest")
+
+    def test_a_session_only_hosts_an_island_its_creator_may_open(self) -> None:
+        # The stranger names the island's session id without having given the island password.
+        stranger = Account(self.backend, "acct-stranger", "192.0.2.7")
+        session = stranger.host()
+        self.assertEqual(session.island, "")
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assertEqual(self.guest.query(), [])
+        stage = f"{self.host.documents}/private/StageData"
+        self.assert_status(server.PERMISSION_DENIED, stranger.get, stage)
+        self.assert_status(server.PERMISSION_DENIED, stranger.commit, update(stage, {}),
+                           context=island_context(PASSWORD))
+
+    def test_island_save_needs_a_member_with_the_island_password(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        save = self.island_save(self.guest_upload())
+        context = island_context(PASSWORD)
+        # A password grant alone, without a user in the island's session, saves nothing.
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save, context=context)
+        self.guest.join(self.host.host(), PASSWORD)
+        # A member needs the island password in the commit's rule context; a commit is one guess.
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save, context=island_context("WRONG0"))
+        self.assertEqual(len(self.backend.guesses.failures[("account", self.guest.principal.account)]), 2)
+        # Only the writes of a save.
+        metadata = f"{self.host.documents}/public/MetaData"
+        uri = f"https://storage.invalid/upload/{self.guest_upload()}"
+        refused = [
+            encode((2, encode((1, stage)))),  # delete
+            encode((3, encode((1, stage), (2, b"x"), (4, "application/octet-stream")))),  # attachment body
+            encode((5, encode((1, metadata), (2, uri)))),  # import into MetaData
+            update(f"{self.host.documents}/private/PasswordData", {"password": text("MINE00")}),
+            update(f"{self.host.documents}/private/SessionIDData", {"sessionID": text("ELSEWHERE")}),
+            update(f"{self.host.documents}/public/Extra", {}),
+        ]
+        for index, write in enumerate(refused):
+            with self.subTest(index=index):
+                self.assert_status(server.PERMISSION_DENIED, self.guest.commit, write, context=context)
+        self.guest.commit(*save, context=context)
+        # A new password ends membership, even for a member who learns it.
+        self.host.commit(update(f"{self.host.documents}/private/PasswordData", {"password": text("NEW123")}))
+        self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}),
+                           context=island_context("NEW123"))
+
+    def test_island_membership_ends_with_the_members_game(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        session = self.join_island()
+        gone = server.time.time_ns() + (server.USER_SESSION_GRACE_SECONDS + 1) * 1_000_000_000
+        with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
+            self.assertEqual(self.guest.get(stage).get_str(1), stage)
+            with mock.patch.object(server.time, "time_ns", return_value=gone):
+                self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
+                self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}),
+                                   context=island_context(PASSWORD))
+            self.backend.drop_user_session(session, self.guest.user)
+            self.assert_status(server.PERMISSION_DENIED, self.guest.get, stage)
+
+    def test_island_save_counts_against_the_owners_quota(self) -> None:
+        self.join_island()
+        save = self.island_save(self.guest_upload(b"x" * 100))
+        with mock.patch.object(server, "ACCOUNT_BLOB_BYTES", 50):
+            self.assert_status(server.RESOURCE_EXHAUSTED, self.guest.commit, *save, context=island_context(PASSWORD))
+        self.guest.commit(*save, context=island_context(PASSWORD))
+        self.assertEqual(self.storage.usage(self.host.principal.account)[1], 100)
+        self.assertEqual(self.storage.usage(self.guest.principal.account)[1], 0)
 
     # Account deletion
 
@@ -876,6 +1077,163 @@ class StreamAccountingTest(unittest.IsolatedAsyncioTestCase):
         gc.collect()
         await self.settle()
         self.assertEqual((self.server.buffered, self.session.buffered), (0, 0))
+
+
+def watch_request(user_session: str, document: str) -> bytes:
+    """A KeepUserSessionRequest that names `user_session` and watches `document`."""
+    target = encode((1, "userSessions/current/targets/1"), (2, encode((1, document))))
+    return encode((1, user_session), (3, encode((1, target))))
+
+
+class KeepUserSession:
+    """A KeepUserSession call read as the server's call handling reads it. Its responses are kept as
+    bytes and the status it ends with as its code, so the test holds none of its parsed messages."""
+
+    def __init__(self, backend: server.Backend, gamesync_call: server.Call, request: bytes):
+        self.requests: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.requests.put_nowait(request)
+        self.responses: list[bytes] = []
+        self.status: int | None = None
+        self.task = asyncio.create_task(self.run(backend.keep_user_session(gamesync_call, self.incoming())))
+
+    async def incoming(self):
+        while (request := await self.requests.get()) is not None:
+            yield Msg(request)
+
+    async def run(self, responses) -> None:
+        try:
+            async for message in responses:
+                self.responses.append(message)
+        except server.GrpcError as exc:
+            self.status = exc.code
+
+
+class GamesyncLoggingTest(unittest.IsolatedAsyncioTestCase):
+    """What a Gamesync call parses only to log it counts against the connection's request budget,
+    but a description that does not fit is left out of the log: the call is answered as it would
+    be without it, with its own errors."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = server.Store(Path(directory.name))
+        self.backend = server.Backend(store, server.Storage(store, "https://storage.invalid"), 4, "", 443)
+        host = Account(self.backend, "acct-host", "198.51.100.1")
+        guest = Account(self.backend, "acct-guest", "203.0.113.1")
+        host.commit(update(f"{host.documents}/private/PasswordData", {"password": text(PASSWORD)}),
+                    update(f"{host.documents}/private/SessionIDData", {"sessionID": text(SESSION_ID[1:])}))
+        self.island = host.host()
+        ticket = next(ticket for ticket in self.backend.tickets.values() if ticket.session is self.island)
+        guest.get(f"{host.documents}/private/SessionIDData", PASSWORD)
+        self.host_call, self.host_session = self.gamesync(host, ticket.matched[0])
+        self.guest_call, _ = self.gamesync(guest, guest.join(self.island, PASSWORD).get_raws(1)[0])
+        # The connection the Gamesync calls arrive on, whose request budget they count against.
+        self.connection = server.H2Session(types.SimpleNamespace(buffered=0), None, FakeWriter())
+
+    def gamesync(self, account: Account, matched: bytes) -> tuple[server.Call, str]:
+        """A Gamesync call of the user session in a MatchedUserSession, and that user session."""
+        user_session, matchmaking_token = Msg(matched).get_str(2), Msg(matched).get_str(3)
+        request = encode((1, f"userSessions/{user_session.rpartition('/')[2]}"), (2, matchmaking_token))
+        token = Msg(self.backend.gamesync_issue_token(account.call(), Msg(request))).get_msg(1).get_str(2)
+        return account.call(token), user_session
+
+    async def settle(self) -> None:
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+    async def test_malformed_session_diagnostic_does_not_end_watch(self) -> None:
+        member = next(member for member in self.island.user_sessions.values()
+                      if member.name == self.host_session)
+        self.backend.gamesync_join(self.island, member)
+        name = server.GAMESYNC_USER_SESSION_DOCS + self.host_session.rpartition('/')[2]
+        self.backend.gamesync_write_documents(
+            self.host_call, Msg(encode((1, update(name, {'ussid': b'\x0f'})))))
+        watch = KeepUserSession(self.backend, self.host_call,
+                                watch_request('userSessions/current', 'docs/__stg/All'))
+        await self.settle()
+        self.assertFalse(watch.task.done())
+        self.backend.gamesync_write_documents(
+            self.host_call, Msg(encode((1, update('docs/__stg/All', {'pl': text('still connected')})))))
+        await self.settle()
+        self.assertTrue(any(b'still connected' in response for response in watch.responses))
+        watch.requests.put_nowait(None)
+        await self.settle()
+        self.assertIsNone(watch.status)
+
+    async def test_committed_write_is_answered_when_logging_it_does_not_fit(self) -> None:
+        # A valid value the write stores as it is, an array of 50,000 small integers: looking for
+        # session descriptions in it parses every element, past the connection's 48 MiB.
+        many = encode((9, encode(*[(1, encode((3, 1)))] * 50_000)))  # common.Value array_value
+        sdp = "v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\na=candidate:1 1 udp 1 192.0.2.7 50000 typ host\r\n"
+        token = server.request_budget.set(self.connection)
+        try:
+            with self.assertLogs(server.log, "INFO") as logs:
+                watch = KeepUserSession(self.backend, self.host_call,
+                                        watch_request("userSessions/current", "docs/__stg/All"))
+                await self.settle()
+                self.backend.gamesync_write_documents(
+                    self.host_call, Msg(encode((1, update("docs/__stg/All", {"pl": many})))))
+                await self.settle()
+                self.backend.gamesync_write_documents(
+                    self.host_call, Msg(encode((1, update("docs/__stg/Sdp", {"sdp": text(sdp)})))))
+                watch.requests.put_nowait(None)
+                await self.settle()
+        finally:
+            server.request_budget.reset(token)
+        output = "\n".join(logs.output)
+        self.assertIn(f"gamesync docs/__stg/All written by {self.host_session}: SDP not looked for "
+                      "(too much request data in flight)", output)
+        self.assertIn("-> <not described: too much request data in flight>", output)
+        self.assertIn("candidates: a=candidate:1 1 udp 1 192.0.2.7 50000 typ host", output)  # what fits is logged
+        self.assertEqual(server.doc_entries(self.island.gamesync.docs["docs/__stg/All"])["pl"], many)
+        self.assertTrue(any(many in response for response in watch.responses))  # the watcher was told
+        self.assertIsNone(watch.status)  # and its call went on until the client closed it
+        gc.collect()
+        self.assertEqual(self.connection.buffered, 0)
+
+    async def test_another_users_session_is_refused_when_describing_the_request_does_not_fit(self) -> None:
+        request = watch_request(self.host_session, "docs/__stg/All")
+        # Room for the request and no more, so describing it for the log cannot parse its target.
+        self.connection.buffered = server.MAX_CONNECTION_BUFFER_BYTES - server.message_cost(len(request), 2)
+        token = server.request_budget.set(self.connection)
+        try:
+            with self.assertLogs(server.log, "INFO") as logs:
+                watch = KeepUserSession(self.backend, self.guest_call, request)
+                await self.settle()
+        finally:
+            server.request_budget.reset(token)
+        self.assertIn("<- <not described: too much request data in flight>", "\n".join(logs.output))
+        self.assertEqual(watch.status, server.PERMISSION_DENIED)
+
+    async def test_write_still_fails_on_its_own_errors(self) -> None:
+        malformed = encode((1, encode((1, encode((1, "docs/__stg/All"), (2, b"\x0f"))))))  # fields: wire type 7
+        request = encode((1, update("docs/__stg/All", {"pl": text("A")})))
+        token = server.request_budget.set(self.connection)
+        try:
+            with self.assertRaises(ValueError):
+                self.backend.gamesync_write_documents(self.host_call, Msg(malformed))
+            # Room for the request and no more, so the write cannot parse its operation.
+            self.connection.buffered = server.MAX_CONNECTION_BUFFER_BYTES - server.message_cost(len(request), 1)
+            with self.assertRaises(server.GrpcError) as refused:
+                self.backend.gamesync_write_documents(self.host_call, Msg(request))
+            self.assertEqual(refused.exception.code, server.RESOURCE_EXHAUSTED)
+        finally:
+            server.request_budget.reset(token)
+        self.assertNotIn("docs/__stg/All", self.island.gamesync.docs)
+
+    async def test_descriptions_that_do_not_fit_are_left_out(self) -> None:
+        entries = {"uid": encode((7, "u-1")), "ussid": encode((3, 1)), "ucsid": encode((3, 2))}
+        self.assertEqual(server.describe_user_session_document(entries), "uid=u-1 ussid=1 ucsid=2")
+        with self.assertRaises(ValueError):  # data that does not decode is not hidden
+            server.describe_keep_user_session_response(b"\x0f")
+        self.connection.buffered = server.MAX_CONNECTION_BUFFER_BYTES  # other calls hold all of it
+        token = server.request_budget.set(self.connection)
+        try:
+            self.assertEqual(server.describe_user_session_document(entries),
+                             "<not described: too much request data in flight>")
+        finally:
+            server.request_budget.reset(token)
+        self.assertEqual(self.connection.buffered, server.MAX_CONNECTION_BUFFER_BYTES)
 
 
 if __name__ == "__main__":
