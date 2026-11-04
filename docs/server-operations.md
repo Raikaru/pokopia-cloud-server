@@ -186,8 +186,9 @@ treated as host even if it also owns another profile in the session.
 
 The host polls GET `/campaign/live/proposals?session=...&epoch=...&after=...` with the last global
 sequence it consumed, initially 0. Each result has a global `seq`, `producer`, producer `number`
-and `event`. Each queue keeps the last 1,024 entries; a request or retry that reaches older entries
-fails rather than silently skipping them. A POST and a poll carry at most 64 events, POST bodies at
+and `event`. The bridge validates contiguous global sequence numbers and, within a page, each
+producer's numbers. Each queue keeps the last 1,024 entries; a request or retry that reaches older
+entries fails rather than silently skipping them. A POST and a poll carry at most 64 events, POST bodies at
 most 16 KiB, and a session accepts at most 64 distinct producers per epoch. Exceeding that producer
 limit fails until a new epoch; it does not discard a producer's retry history. Host departure
 refuses new proposals, and the host returning in a new user session starts a new epoch.
