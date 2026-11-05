@@ -3058,7 +3058,8 @@ class Backend:
             resolved.append(definition if canonical == user else replace_field(msg, 1, canonical))
         return resolved
 
-    def join(self, call: Call, session: GameSession, definitions: list[bytes], now: int) -> list[bytes]:
+    def join(self, call: Call, session: GameSession, definitions: list[bytes], now: int,
+             session_password_proved: bool = False) -> list[bytes]:
         """Adds users to a session and returns their MatchedUserSessions."""
         matched = []
         tenant_id = call.metadata.get("npln-tenant-id", "t-15f83830-lp1")
@@ -3070,9 +3071,14 @@ class Backend:
                 if len(session.user_sessions) >= session.max_participants:
                     raise GrpcError(RESOURCE_EXHAUSTED, f"{session.name} is full")
                 self.leave_other_sessions(user, session)
+                island = session.island or session.creator
+                password = self.island_password(island)
+                authorized = (call.principal is None or self.owns(call, island) or self.has_grant(call, island)
+                              or (session_password_proved and bool(password)
+                                  and hmac.compare_digest(session.password.encode(), password.encode())))
+                version = self.island_password_version(island) if authorized else ""
                 user_session = UserSession(f"{session.name}/userSessions/{random_id()}", user,
-                                           definition, now, now,
-                                           self.island_password_version(session.island or session.creator))
+                                           definition, now, now, version)
                 session.user_sessions[user] = user_session
             token = self.signer.issue(typ="matchmaking", sub=user, game_session=session.name,
                                       **self.owner_claims(call),
@@ -3249,11 +3255,12 @@ class Backend:
         session = self.visible_session(call, req.get_str(1))
         definitions = self.user_definitions(call, req.get_raws(3))
         # Client-certificate mode: newcomers need the session password (field 2).
-        if call.principal is not None and session.password and any(
-                Msg(definition).get_str(1) not in session.user_sessions for definition in definitions) \
-                and not self.check_password(call, session.password, req.get_str(2), f"session {session.name}"):
+        password_proved = (call.principal is not None and bool(session.password) and any(
+            Msg(definition).get_str(1) not in session.user_sessions for definition in definitions))
+        if password_proved and not self.check_password(
+                call, session.password, req.get_str(2), f"session {session.name}"):
             raise GrpcError(PERMISSION_DENIED, "wrong password")
-        matched = self.join(call, session, definitions, time.time_ns())
+        matched = self.join(call, session, definitions, time.time_ns(), session_password_proved=password_proved)
         log.info("joined %s: %s", session.name, ", ".join(session.user_sessions))
         return encode(*[(1, entry) for entry in matched], (2, self.encode_session(call, session)))
 

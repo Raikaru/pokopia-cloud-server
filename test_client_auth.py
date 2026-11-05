@@ -513,6 +513,25 @@ class ClientAuthTest(unittest.TestCase):
         self.assertEqual(self.guest.query(), [])
         self.assert_status(server.PERMISSION_DENIED, self.guest.get, f"{self.host.documents}/private/StageData")
 
+    def test_rejoining_after_password_change_does_not_restore_read_access(self) -> None:
+        session = self.join_island()
+        self.host.commit(update(f"{self.host.documents}/private/PasswordData", {"password": text("NEW123")}))
+        another_profile = Account(self.backend, "acct-guest", "203.0.113.1", profile="second-profile")
+        another_profile.join(session, PASSWORD)
+        self.assert_status(server.PERMISSION_DENIED, another_profile.get,
+                           f"{self.host.documents}/private/StageData")
+
+    def test_join_proved_with_current_island_password_survives_grant_expiry(self) -> None:
+        session = self.host.host()
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.guest.join(session, PASSWORD)
+        another_profile = Account(self.backend, "acct-guest", "203.0.113.1", profile="second-profile")
+        with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
+            another_profile.join(session, PASSWORD)
+            self.backend.drop_user_session(session, self.guest.user)
+            stage = f"{self.host.documents}/private/StageData"
+            self.assertEqual(another_profile.get(stage).get_str(1), stage)
+
     def test_request_may_only_name_own_users(self) -> None:
         session = self.host.host()
         self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
