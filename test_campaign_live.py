@@ -86,8 +86,8 @@ class Account:
         context = server.encode_map({"password": text(password)})
         return Msg(self.backend.get_document(self.call(), Msg(encode((1, name), (3, context)))))
 
-    def host(self, password: str = PASSWORD) -> server.GameSession:
-        properties = server.encode_map({"string1": text(SESSION_ID)})
+    def host(self, password: str = PASSWORD, session_id: str = SESSION_ID) -> server.GameSession:
+        properties = server.encode_map({"string1": text(session_id)})
         ticket_request = encode((2, "tenants/current/matchmakingConfigs/MatchmakingConfigsDefault"),
                                 (3, encode((1, "tenants/current/users/current"))),
                                 (6, encode((6, password), (11, properties))))
@@ -324,7 +324,7 @@ class CampaignLiveTest(unittest.IsolatedAsyncioTestCase):
         epoch = await self.epoch()
         second = Account(self.backend, self.host.principal.account, self.host.network, profile="second")
         self.assertNotEqual(second.user, self.host.user)
-        second.host(password="")
+        second.host(password="", session_id=":OTHER-SESSION")
         self.assert_error(await self.bridge(self.host).discover(), 404, "ambiguous_session")
         status, state = await self.bridge(self.host).poll(self.session.name, epoch, 0)
         self.assertEqual((status, state["role"]), (200, "host"), state)

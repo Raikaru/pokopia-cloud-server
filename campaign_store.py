@@ -4,7 +4,8 @@ the registry of who may use them.
 A campaign is the story progress and the stage terrain that the players of one shared story map
 have reached together. CampaignStore keeps its checkpoints on the server's disk; CampaignRegistry
 records beside them the account that owns each campaign and the accounts it is shared with, and is
-the way in that checks them. Neither has a network API, and nothing in server.py uses them yet.
+the way in that checks them. Neither has a network API; server.py uses the registry for backups and
+account deletion only (see "Integration with server.py" below).
 
 What a checkpoint holds, and the only representations accepted:
   * The story block of a 2.0.1 common save (CMNDAT.BIN, save version 0x0200017D): the
@@ -68,6 +69,14 @@ F_FULLFSYNC, then a rename made durable, MoveFileExW with MOVEFILE_WRITE_THROUGH
     newest, complete and untouched; a crash leaves only staging files and unreferenced objects,
     which the next commit removes. If the platform cannot promise the payloads are on disk the
     commit fails (DurabilityError) rather than publish a manifest that refers to them.
+  * A commit can be fenced (commit's `fence`): the caller decides, under the campaign's lock, with
+    every payload durable and immediately before the manifest's rename, whether the checkpoint is
+    published. The fence sees a CommitIntent: the checkpoint, the campaign's owner, and what the
+    campaign takes before and after (usage()). Refused, nothing is published and the payload files
+    the commit added are deleted; let through, its Settle learns once the commit published or
+    failed, still under the lock, what the campaign measures then. One campaign's lock orders its
+    commits, so their fences and Settles come in commit order. What a fence checks (a game
+    session's host, a quota) is the caller's.
   * Readback checks everything: the manifest's format version (MANIFEST_FORMAT, 2), structure,
     campaign and revision, the kind and version of each payload, and each payload's size and SHA-256
     (IntegrityError). A manifest of any other format, such as format 1 (story block and stages only,
@@ -122,24 +131,24 @@ spaces, compared exactly.
     PurgeResult.unfinished, and calling it again finishes. accounts() names every account that
     still appears in some campaign's metadata.
 
-Not integrated, for the caller to wire up:
-  * Routes: no server route calls the registry. Routes must go through CampaignRegistry, never
-    CampaignStore, whose methods check no account.
-  * Account deletion: server.py's purge_deleted_accounts does not call purge_account; it would,
-    for each deleted account that accounts() names, as it calls Backend.purge_account.
-  * Backups: server.py's Store.snapshot and SnapshotService capture only state.json and blobs.
-    CampaignRegistry.capture_backup() captures the whole registry (see it): every campaign's
-    metadata, every retained checkpoint's manifest and payload files, the deleted campaigns'
-    tombstones and the purged accounts' markers, as a RegistryBackup of files, each with its path
-    under the root, size, SHA-256 and a reader of its pinned contents, and a summary for
-    snapshot.json. A snapshot would add them as data/campaigns/<path>, the names snapshot.py
-    admits. Restored under an empty root, they form a working store and registry that give each
-    account the access it had when the backup was taken. A restored backup also brings back
-    checkpoints, campaigns and members changed or removed after it was taken, and an account
+Integration with server.py:
+  * Routes: none. campaign_api.CampaignApi serves the registry over HTTP, but server.py does not
+    dispatch to it; its description says what is still missing. Routes must go through
+    CampaignRegistry, never CampaignStore, whose methods check no account.
+  * Account deletion: at startup and then every minute, server.py calls purge_account for every
+    deleted account that accounts() still names, so what a purge left unfinished is retried.
+  * Backups: SnapshotService captures the whole registry with capture_backup() (see it): every
+    campaign's metadata, every retained checkpoint's manifest and payload files, the deleted
+    campaigns' tombstones and the purged accounts' markers, as a RegistryBackup of files, each with
+    its path under the root, size, SHA-256 and a reader of its pinned contents. The snapshot adds
+    them as data/campaigns/<path>, the names snapshot.py admits, and lists them in its
+    campaign_inventory. Restored under an empty root, they form a working store and registry that
+    give each account the access it had when the backup was taken. A restored backup also brings
+    back checkpoints, campaigns and members changed or removed after it was taken, and an account
     purged since is not purged in it until purge_account is called for it again.
-  * Quotas: campaign bytes are not counted by server.py's room_for (--max-storage-mb, the per-account
-    128 MiB of blobs, MIN_FREE_DISK_BYTES). usage() gives what a campaign takes; the store applies
-    only its own max_campaign_bytes and min_free_bytes, and the registry its max_owned.
+  * Quotas: server.py does not count campaign bytes in its per-account or global storage quota.
+    The store applies its own max_campaign_bytes and min_free_bytes, and the registry its max_owned.
+    A server exposing commits must account for campaign usage and fence concurrent quota changes.
 
 The methods block on disk I/O (a commit hashes, inflates and flushes up to 32 MiB); run them off an
 event loop (asyncio.to_thread). CampaignStore and CampaignRegistry hold no state of their own
@@ -168,7 +177,7 @@ import weakref
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable, Iterator, Mapping, Optional
 
 try:
     import fcntl  # POSIX: flock, and F_FULLFSYNC on macOS
@@ -412,6 +421,26 @@ class CheckpointData:
     story: bytes
     unique: bytes  # UNIQUE_SIZE bytes, exactly as committed
     stages: Mapping[int, bytes]
+
+
+@dataclass(frozen=True)
+class CommitIntent:
+    """What a commit is about to publish, as its fence (commit's `fence`) sees it: under the
+    campaign's lock, with every payload of the checkpoint durable in objects/ and its manifest not
+    yet published."""
+
+    campaign: str
+    owner: str | None  # the campaign's owner (CampaignRegistry.commit); None for CampaignStore.commit
+    checkpoint: Checkpoint  # what the commit publishes if the fence lets it: revision, etag, parent, author
+    before: int  # the bytes the campaign takes now, as usage() counts them
+    after: int  # the bytes it takes once published and its retention has dropped older checkpoints
+
+
+# A fence's answer: None, or a callable that the commit calls once, still under the lock, after it
+# published or failed, with what usage() measures then (None if that could not be read).
+Settle = Callable[[Optional[int]], None]
+# Called once per commit that would publish a checkpoint (CommitIntent); raises to refuse it.
+Fence = Callable[[CommitIntent], Optional[Settle]]
 
 
 @dataclass(frozen=True)
@@ -953,7 +982,8 @@ class _Plan:
     directory: Path
     checkpoint: Checkpoint
     manifest: bytes
-    payloads: dict[str, bytes]  # new payloads by SHA-256
+    payloads: dict[str, bytes]  # the commit's payloads by SHA-256, whether or not a file has them already
+    footprint: int  # the campaign's bytes once published and collected (CommitIntent.after)
 
 
 @dataclass(frozen=True)
@@ -1065,7 +1095,7 @@ class CampaignStore:
 
     def commit(self, campaign: str, expected: str | None, *, story: bytes | None = None,
                unique: bytes | None = None, stages: Mapping[int, bytes | None] | None = None,
-               author: str | None = None) -> Checkpoint:
+               author: str | None = None, fence: Fence | None = None) -> Checkpoint:
         """Makes a new checkpoint from the newest one, which must have the etag `expected` (None: the
         campaign must have no checkpoint yet), and returns it.
 
@@ -1078,16 +1108,25 @@ class CampaignStore:
         checkpoint as it is, unless a payload it sends is stored damaged: then a new revision with
         the same content rewrites that file. `author` (at most 512 bytes) is recorded in the manifest.
 
+        `fence`, if given, decides at the last moment whether the checkpoint is published. It is
+        called once, on this thread and under the campaign's lock, once every payload of the new
+        checkpoint is durable and immediately before its manifest is published (the commit's one
+        atomic step), with the CommitIntent; a commit that changes nothing does not call it. If it
+        raises, nothing is published, the payload files the commit added are deleted again, and its
+        exception propagates. It may return a Settle, which is then called exactly once, still under
+        the lock, after the commit published or failed, with what usage() measures at that point
+        (None if that cannot be read); an exception it raises is logged, never passed on.
+
         Nothing is changed when it raises RevisionConflict, PayloadError (PayloadTooLarge),
         QuotaExceeded, CampaignBusy, CampaignNotFound (the campaign was deleted: its ID is never used
-        again) or IntegrityError (the newest manifest, or a payload the commit keeps, is damaged;
+        again), IntegrityError (the newest manifest, or a payload the commit keeps, is damaged;
         UnsupportedFormat if the newest checkpoint has a manifest format or payload version this
-        module does not read, such as format 1 without a unique quest history). For StorageError and
-        DurabilityError see their `committed`."""
+        module does not read, such as format 1 without a unique quest history) or what `fence`
+        raised. For StorageError and DurabilityError see their `committed`."""
         directory = self._directory(campaign)
         change = self._check_change(expected, story, unique, stages, author)
         with self._locked(campaign):
-            return self._commit_locked(directory, campaign, change)
+            return self._commit_locked(directory, campaign, change, fence=fence)
 
     def delete(self, campaign: str, *, if_match: str | None = None) -> bool:
         """Deletes the campaign with every checkpoint, for good: its ID is never used again. With
@@ -1219,14 +1258,15 @@ class CampaignStore:
                 updates[number] = bytes(data), raw_size  # no copy of bytes, which callers pass
         return _Change(expected, new_common, updates, author)
 
-    def _commit_locked(self, directory: Path, campaign: str, change: _Change) -> Checkpoint:
+    def _commit_locked(self, directory: Path, campaign: str, change: _Change, *, owner: str | None = None,
+                       fence: Fence | None = None) -> Checkpoint:
         with _io(f"campaign {campaign}: commit failed", committed=False):
             if self._gone(campaign):
                 raise CampaignNotFound(f"campaign {campaign} was deleted; its ID is not used again")
             plan = self._plan(campaign, directory, change.expected, change.common, change.updates, change.author)
         if isinstance(plan, Checkpoint):
             return plan
-        return self._apply(plan)
+        return self._apply(plan, owner, fence)
 
     def _delete_locked(self, directory: Path, campaign: str, if_match: str | None) -> bool:
         """Publishes the campaign's tombstone, then moves its directory into the trash, which the
@@ -1383,13 +1423,13 @@ class CampaignStore:
         growth = len(manifest) + sum(len(data) for sha256, data in payloads.items() if not (objects / sha256).exists())
         if shutil.disk_usage(self.root).free - growth < self.min_free_bytes:
             raise QuotaExceeded("the disk is nearly full")
-        return _Plan(campaign, directory, checkpoint, manifest, payloads)
+        return _Plan(campaign, directory, checkpoint, manifest, payloads, footprint)
 
-    def _apply(self, plan: _Plan) -> Checkpoint:
-        """Writes the payloads, then publishes the manifest: the commit's one atomic step."""
+    def _apply(self, plan: _Plan, owner: str | None = None, fence: Fence | None = None) -> Checkpoint:
+        """Writes the payloads, lets `fence` (if any) decide, then publishes the manifest: the commit's
+        one atomic step. A Settle the fence returned is called whatever happens after it."""
         campaign, directory = plan.campaign, plan.directory
         staging, objects, checkpoints = directory / "staging", directory / "objects", directory / "checkpoints"
-        committed: bool | None = False
         try:
             _make_directory(directory)
             for path in (staging, objects, checkpoints):
@@ -1397,28 +1437,69 @@ class CampaignStore:
             for name in os.listdir(staging):  # left by an interrupted commit: this one holds the lock
                 _remove(staging / name, "staging file")
             if not (_sync_directory(self.root) and _sync_directory(directory)):
-                raise DurabilityError(f"campaign {campaign}: its directories cannot be made durable", committed)
+                raise DurabilityError(f"campaign {campaign}: its directories cannot be made durable", False)
+            created = [sha256 for sha256 in plan.payloads if not os.path.lexists(objects / sha256)]
             for sha256, data in plan.payloads.items():
                 self._store_object(staging, objects / sha256, data, sha256)
             if not _sync_directory(objects):
-                raise DurabilityError(f"campaign {campaign}: its payloads cannot be made durable", committed)
+                raise DurabilityError(f"campaign {campaign}: its payloads cannot be made durable", False)
             target = checkpoints / _manifest_name(plan.checkpoint.revision)
             if os.path.lexists(target):
                 raise IntegrityError(f"campaign {campaign}: {target.name} exists but is not the newest checkpoint")
-            temp = self._stage(staging, plan.manifest)
-            committed = None
-            durable = _publish(temp, target)
-            committed = True
-            if not durable:
-                raise DurabilityError(f"campaign {campaign}: revision {plan.checkpoint.revision} is committed, but "
-                                      "the platform did not promise it is on disk", committed)
-            if _read_bounded(target, MAX_MANIFEST_BYTES) != plan.manifest:
-                raise StorageError(f"campaign {campaign}: revision {plan.checkpoint.revision} is committed, but its "
-                                   "manifest reads back differently", committed)
+            before = self._footprint(directory, campaign, self._revisions(directory), {}) if fence is not None else 0
         except OSError as exc:
-            raise StorageError(f"campaign {campaign}: commit failed: {exc}", committed) from exc
-        self._collect(directory, campaign)
+            raise StorageError(f"campaign {campaign}: commit failed: {exc}", False) from exc
+        settle = None
+        if fence is not None:
+            intent = CommitIntent(campaign, owner, plan.checkpoint, before, plan.footprint)
+            settle = self._fence(directory, intent, fence, created)
+        try:
+            committed: bool | None = False
+            try:
+                temp = self._stage(staging, plan.manifest)
+                committed = None
+                durable = _publish(temp, target)
+                committed = True
+                if not durable:
+                    raise DurabilityError(f"campaign {campaign}: revision {plan.checkpoint.revision} is committed, "
+                                          "but the platform did not promise it is on disk", committed)
+                if _read_bounded(target, MAX_MANIFEST_BYTES) != plan.manifest:
+                    raise StorageError(f"campaign {campaign}: revision {plan.checkpoint.revision} is committed, but "
+                                       "its manifest reads back differently", committed)
+            except OSError as exc:
+                raise StorageError(f"campaign {campaign}: commit failed: {exc}", committed) from exc
+            self._collect(directory, campaign)
+        finally:
+            if settle is not None:
+                self._settle(directory, campaign, settle)
         return plan.checkpoint
+
+    @staticmethod
+    def _fence(directory: Path, intent: CommitIntent, fence: Fence, created: list[str]) -> Settle | None:
+        """What `fence` answers for `intent`. If it raises, the payload files the commit added (`created`)
+        are deleted again: no manifest refers to them, and the lock keeps any other commit out."""
+        try:
+            settle = fence(intent)
+            if settle is not None and not callable(settle):
+                raise TypeError("a fence returns a Settle or None")
+        except BaseException:
+            for sha256 in created:
+                _remove(directory / "objects" / sha256, "payload of a commit its fence refused")
+            raise
+        return settle
+
+    def _settle(self, directory: Path, campaign: str, settle: Settle) -> None:
+        """Calls a fence's Settle with what the campaign takes now, as usage() counts it (None if that
+        cannot be read). Never raises."""
+        try:
+            measured: int | None = self._footprint(directory, campaign, self._revisions(directory), {})
+        except (OSError, CampaignError) as exc:
+            log.warning("campaign %s: could not measure it after a commit: %s", campaign, exc)
+            measured = None
+        try:
+            settle(measured)
+        except Exception:
+            log.exception("campaign %s: settling a commit with its fence failed", campaign)
 
     def _stage(self, staging: Path, data: bytes) -> Path:
         """A new file in `staging` holding `data`, flushed to disk (DurabilityError if the platform does
@@ -1924,11 +2005,14 @@ class CampaignRegistry:
         log.info("campaign %s: deleted by its owner %s", campaign, account)
 
     def commit(self, campaign: str, account: str, expected: str | None, *, story: bytes | None = None,
-               unique: bytes | None = None, stages: Mapping[int, bytes | None] | None = None) -> Checkpoint:
+               unique: bytes | None = None, stages: Mapping[int, bytes | None] | None = None,
+               fence: Fence | None = None) -> Checkpoint:
         """CampaignStore.commit, for the campaign's owner or a member (CampaignNotFound for anyone
         else), recording the account as the checkpoint's author. Access is checked before the
         payloads are, so that nothing is inflated for an account without it, and again under the
-        lock that the commit holds, so that a removal or deletion made in between is respected."""
+        lock that the commit holds, so that a removal or deletion made in between is respected.
+        `fence` is CampaignStore.commit's; its CommitIntent names the campaign's owner, read under
+        that lock."""
         account = _check_account(account)
         directory = self.store._directory(campaign)
         with self.store._locked(campaign), _io(f"campaign {campaign}: commit failed", committed=False):
@@ -1936,8 +2020,8 @@ class CampaignRegistry:
         change = self.store._check_change(expected, story, unique, stages, account)
         with self.store._locked(campaign):
             with _io(f"campaign {campaign}: commit failed", committed=False):
-                self._authorize(directory, campaign, account)
-            return self.store._commit_locked(directory, campaign, change)
+                info = self._authorize(directory, campaign, account)
+            return self.store._commit_locked(directory, campaign, change, owner=info.owner, fence=fence)
 
     def purge_account(self, account: str) -> PurgeResult:
         """Removes an account an operator deleted from every campaign, for good. It first marks the

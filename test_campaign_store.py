@@ -284,6 +284,70 @@ class CampaignStoreTest(unittest.TestCase):
         self.assertIs(caught.exception.committed, False)
         self.assertEqual(self.store.head("map1"), first)
 
+    def test_a_fence_decides_with_the_payloads_written_and_nothing_published(self) -> None:
+        first = self.store.commit("map1", None, **common(1), stages={1: stage_file(1)})
+        before = self.store.usage("map1")
+        seen: list[object] = []
+
+        def fence(intent: cs.CommitIntent) -> cs.Settle:
+            seen.append((intent, os.listdir(self.root / "map1" / "checkpoints"), self.objects("map1")))
+            return seen.append
+
+        second = self.store.commit("map1", first.etag, **common(2), stages={2: stage_file(2)}, author="host",
+                                   fence=fence)
+        (intent, manifests, objects), measured = seen
+        self.assertEqual(intent, cs.CommitIntent("map1", None, second, before, self.store.usage("map1")))
+        self.assertEqual(manifests, [self.manifest("map1", 1).name])  # the fence came before the rename
+        self.assertLessEqual(set(second.objects()), objects)  # and after every payload was written
+        self.assertEqual(measured, self.store.usage("map1"))
+        self.assertEqual(self.store.head("map1"), second)
+        # A commit that changes nothing publishes nothing, so its fence is not asked.
+        self.assertEqual(self.store.commit("map1", second.etag, **common(2), fence=fence), second)
+        self.assertEqual(len(seen), 2)
+
+    def test_a_refusing_fence_publishes_nothing_and_takes_back_its_payloads(self) -> None:
+        first = self.store.commit("map1", None, **common(1), stages={1: stage_file(1)})
+        kept = self.objects("map1")
+
+        class Refused(Exception):
+            pass
+
+        def refuse(intent: cs.CommitIntent) -> None:
+            self.assertLess(set(first.objects()), self.objects("map1"))  # the new payloads are written
+            raise Refused()
+
+        with self.assertRaises(Refused):  # stage 1 is sent again, unchanged: it stays
+            self.store.commit("map1", first.etag, **common(2), stages={1: stage_file(1), 2: stage_file(2)},
+                              fence=refuse)
+        self.assertEqual(self.store.head("map1"), first)
+        self.assertEqual(self.objects("map1"), kept)
+        second = self.store.commit("map1", first.etag, **common(2), fence=lambda intent: None)
+        self.assertEqual((second.revision, second.parent), (2, first.etag))
+
+    def test_a_settle_learns_what_a_failed_publication_left(self) -> None:
+        first = self.store.commit("map1", None, **common(1))
+        settled: list[int | None] = []
+        publish = cs._publish
+
+        def crash_on_manifest(temp: Path, path: Path) -> bool:
+            if path.parent.name == "checkpoints":
+                raise OSError(errno.EIO, "simulated crash")
+            return publish(temp, path)
+
+        with mock.patch.object(cs, "_publish", crash_on_manifest):
+            with self.assertRaises(cs.StorageError) as caught:
+                self.store.commit("map1", first.etag, **common(2), fence=lambda intent: settled.append)
+        self.assertIsNone(caught.exception.committed)
+        self.assertEqual(settled, [self.store.usage("map1")])
+        self.assertEqual(self.store.head("map1"), first)
+
+        def broken(measured: int | None) -> None:
+            raise RuntimeError("the settle failed")
+
+        with self.assertLogs("npln.campaign", "ERROR"):  # logged, not passed on: the commit landed
+            second = self.store.commit("map1", first.etag, **common(3), fence=lambda intent: broken)
+        self.assertEqual(self.store.head("map1"), second)
+
     def test_damaged_payload_is_detected_and_can_be_replaced(self) -> None:
         first = self.store.commit("map1", None, **common(1), stages={1: stage_file(1)})
         path = self.root / "map1" / "objects" / first.stages[1].sha256

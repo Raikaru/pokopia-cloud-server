@@ -134,6 +134,17 @@ class CampaignRegistryTest(unittest.TestCase):
                 self.registry.commit(campaign, FRIEND, None, **common(1))
         self.assertIsNone(self.registry.head(campaign, OWNER))
 
+    def test_a_commit_fence_names_the_owner_and_follows_the_access_check(self) -> None:
+        campaign = self.shared().campaign
+        intents: list[cs.CommitIntent] = []
+        first = self.registry.commit(campaign, FRIEND, None, **common(1), fence=intents.append)
+        self.assertEqual(first.author, FRIEND)
+        self.assertEqual([(intent.campaign, intent.owner, intent.checkpoint) for intent in intents],
+                         [(campaign, OWNER, first)])  # a member commits; the owner's quota pays
+        with self.assertRaises(cs.CampaignNotFound):
+            self.registry.commit(campaign, STRANGER, first.etag, **common(2), fence=intents.append)
+        self.assertEqual(len(intents), 1)
+
     def test_a_deleted_campaign_is_never_revived(self) -> None:
         campaign = self.shared().campaign
         first = self.registry.commit(campaign, FRIEND, None, **common(1))

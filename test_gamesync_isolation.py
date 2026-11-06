@@ -3,7 +3,8 @@ deferred writes fail. Deferred writes stay within the Gamesync limit and are app
 memory pressure and after their tokens expire, one at a time, each as a commit of its own within a
 parsing budget of its own, and commits copy no more than they may. With --turn the ICE server set
 carries TURN credentials coturn accepts, and with --relay-only every Gamesync delivery offers only
-relay candidates on that TURN server.
+relay candidates on that TURN server: a P2P message left with none is withheld, and the next one its
+sender writes shown under the first one's index.
 
 Run them from this directory with the dependencies installed:
 
@@ -194,6 +195,42 @@ class GamesyncIsolationTest(unittest.TestCase):
         with self.assertRaises(server.GrpcError) as raised:
             method(gamesync_call, Msg(request))
         self.assertEqual(raised.exception.code, code)
+
+    def test_disconnected_member_expires_without_a_new_request(self) -> None:
+        async def scenario() -> None:
+            with mock.patch.object(server, "USER_SESSION_GRACE_SECONDS", 0.05):
+                session, owner = host(self.backend, "u-owner")
+                visitor = join(self.backend, session, "u-visitor")
+                owner_watch = Watch(self.backend, owner.call)
+                visitor_watch = Watch(self.backend, visitor.call, f"docs/__us/{owner.id}")
+                await settle()
+                await owner_watch.close()
+                self.assertIn(f"{TENANT}/users/u-owner", session.user_sessions)
+                await asyncio.sleep(0.15)
+                await settle()
+                self.assertNotIn(f"{TENANT}/users/u-owner", session.user_sessions)
+                self.assertTrue(any(kind == server.DOCUMENT_CHANGE_DELETED and name == f"docs/__us/{owner.id}"
+                                    for kind, name, _ in visitor_watch.changes()))
+                self.assertIn(f"{TENANT}/users/u-visitor", session.user_sessions)
+                await visitor_watch.close()
+
+        asyncio.run(scenario())
+
+    def test_reconnected_member_survives_disconnect_grace(self) -> None:
+        async def scenario() -> None:
+            with mock.patch.object(server, "USER_SESSION_GRACE_SECONDS", 0.05):
+                session, owner = host(self.backend, "u-owner")
+                first = Watch(self.backend, owner.call)
+                await settle()
+                await first.close()
+                second = Watch(self.backend, owner.call)
+                await settle()
+                await asyncio.sleep(0.15)
+                self.assertIn(f"{TENANT}/users/u-owner", session.user_sessions)
+                self.assertIn(session.name, self.backend.sessions)
+                await second.close()
+
+        asyncio.run(scenario())
 
     def test_simultaneous_islands(self) -> None:
         asyncio.run(self.simultaneous_islands())
@@ -769,6 +806,56 @@ DELIVERED_FIELDS = {
 }
 
 
+# One P2P message per ICE candidate, as the game sends them: its host candidate, a server-reflexive
+# one and its relay candidate on the TURN server; and that relay candidate as players are shown it.
+HOST_CANDIDATE = "a=candidate:1 1 udp 2113929727 192.168.1.43 56371 typ host"
+SRFLX_CANDIDATE = "a=candidate:2 1 udp 1677722111 198.51.100.7 54515 typ srflx raddr 192.168.1.43 rport 54515"
+RELAY_CANDIDATE = "a=candidate:3 1 udp 33562623 203.0.113.10 49170 typ relay raddr 198.51.100.7 rport 54515"
+SHOWN_RELAY = ["a=candidate:3 1 udp 33562623 203.0.113.10 49170 typ relay raddr 0.0.0.0 rport 0"]
+EXIST, UPDATED, DELETED = server.DOCUMENT_CHANGE_EXIST, server.DOCUMENT_CHANGE_UPDATED, server.DOCUMENT_CHANGE_DELETED
+
+
+def p2p_message(index: int, candidate: str, sender: str = "sender", connection: int = 7) -> dict[str, bytes]:
+    """The fields of a P2P message (docs/__pgn/All/__stu) as the game writes them: mp.i `index` and a
+    session description offering `candidate`, from user session id `sender` over its `connection`."""
+    sd = "\r\n".join(["v=1", "o=- 4tWGeOeGx7XoJfnP 2 IN IP4 192.168.1.43", "s=-", "t=0 0", "", candidate,
+                      "a=setup:actpass", "a=ice-pwd:qdYfreTF494lmHxtIpyH9K", "a=ice-ufrag:DON1"]) + "\r\n"
+    return {
+        "susid": text(sender),
+        "mp": map_value({"i": encode((3, index)), "r": encode((2, False)), "sd": text(sd), "v": encode((3, 1))}),
+        "suid": text("user"),
+        "suscid": encode((3, connection)),
+        "sussid": encode((3, 1)),
+    }
+
+
+def p2p_shown(fields: dict[str, bytes]) -> tuple[int, list[str]]:
+    """mp.i of a P2P message as a player is shown it, and the candidates of its session description.
+    Fails if any of the player's own addresses is shown."""
+    if leaked := [address for address in PLAYER_ADDRESSES if address in b"".join(fields.values())]:
+        raise AssertionError(f"a player's addresses are shown: {leaked}")
+    mp = server.map_entries(Msg(fields["mp"]).get_bytes(10))
+    sd = Msg(mp["sd"]).get_str(7)
+    return Msg(mp["i"]).get_int(3), [line for line in sd.split("\r\n") if line.startswith("a=candidate:")]
+
+
+def p2p_changes(watch: Watch, name: str) -> list[tuple]:
+    """The changes of document `name` a KeepUserSession call was sent: their kind, then, unless it is
+    a deletion, mp.i and the candidates shown (p2p_shown)."""
+    return [(kind,) if kind == DELETED else (kind, *p2p_shown(fields))
+            for kind, document, fields in watch.changes() if document == name]
+
+
+def send(backend: server.Backend, player: Player, name: str, *messages: dict[str, bytes]) -> None:
+    """Writes P2P messages to document `name`, in one commit."""
+    backend.gamesync_write_documents(player.call, Msg(encode(*[(1, update(name, fields)) for fields in messages])))
+
+
+def delete(backend: server.Backend, player: Player, name: str) -> None:
+    """Deletes document `name` as `player`."""
+    backend.gamesync_write_documents(player.call, Msg(encode((1, encode((4, encode((1, name))))))))
+
+
 class RelayOnlyTest(unittest.TestCase):
     """--turn and --relay-only, through the calls the game makes."""
 
@@ -786,6 +873,11 @@ class RelayOnlyTest(unittest.TestCase):
 
     def relay_backend(self) -> server.Backend:
         return self.backend(server.TurnServer(TURN_IP, 3478, TURN_SECRET), server.RelayOnly(TURN_IP, RELAY_PORTS))
+
+    def assert_status(self, code: int, method, gamesync_call: server.Call, request: bytes) -> None:
+        with self.assertRaises(server.GrpcError) as raised:
+            method(gamesync_call, Msg(request))
+        self.assertEqual(raised.exception.code, code)
 
     def test_ice_server_set_hands_out_turn_credentials(self) -> None:
         backend = self.backend(server.TurnServer(TURN_IP, 3478, TURN_SECRET))
@@ -879,6 +971,253 @@ class RelayOnlyTest(unittest.TestCase):
         self.assertEqual(read_fields(backend, host_player, "docs/h"), {"x": text(DELIVERED_SDP)})
         await watching.close()
         await listing.close()
+
+    def test_messages_without_a_relay_candidate_are_withheld(self) -> None:
+        asyncio.run(self.messages_without_a_relay_candidate_are_withheld())
+
+    async def messages_without_a_relay_candidate_are_withheld(self) -> None:
+        backend = self.relay_backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        inbox = f"docs/__pgn/All/__stu/{guest.id}"
+        watching = Watch(backend, guest.call, inbox)
+        # A second target of the same call covers the inbox too, through its collection.
+        collection = encode((1, "userSessions/current/targets/2"), (3, encode((1, "docs/__pgn/All/__stu"))))
+        watching.requests.put_nowait(encode((3, encode((1, collection)))))
+        await settle()
+
+        # The host's first messages offer only its own addresses: players are shown nothing of them.
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE))
+        transaction = Msg(backend.gamesync_begin_transaction(guest.call, Msg())).get_bytes(1)
+        self.assert_status(server.NOT_FOUND, backend.gamesync_get_document, guest.call,
+                           encode((1, inbox), (3, transaction)))
+        send(backend, host_player, inbox, p2p_message(2, SRFLX_CANDIDATE))
+        # A transaction still commits only while the version stored when it read is.
+        self.assert_status(server.ABORTED, backend.gamesync_commit_transaction, guest.call,
+                           encode((1, update("docs/t", {"x": text("y")})), (3, transaction)))
+        listing = Watch(backend, host_player.call, inbox)
+        await settle()
+        self.assertEqual(p2p_changes(watching, inbox), [])
+        self.assertEqual(p2p_changes(listing, inbox), [])
+        self.assert_status(server.NOT_FOUND, backend.gamesync_get_document, guest.call,
+                           encode((1, inbox), (2, encode((1, "mp.i")))))
+        result = Msg(backend.gamesync_read_documents(guest.call, Msg(encode((1, inbox))))).get_msgs(1)[0]
+        self.assertEqual(result.get_str(2), inbox)  # missing
+        for prefix in ["docs/__pgn/All/__stu", "docs/__pgn/All", "docs/__pgn"]:
+            listed = Msg(backend.gamesync_list_documents(guest.call, Msg(encode((1, prefix), (5, True)))))
+            self.assertEqual(listed.get_msgs(1), [], prefix)
+        collections = Msg(backend.gamesync_query_collection_ids(guest.call, Msg(encode((1, "docs/__pgn/All")))))
+        self.assertEqual(collections.get_strs(1), [])
+
+        # The relay candidate is shown as the first message: to every call and target, by every read.
+        send(backend, host_player, inbox, p2p_message(3, RELAY_CANDIDATE))
+        await settle()
+        first = (EXIST, 1, SHOWN_RELAY)
+        self.assertEqual(p2p_changes(watching, inbox), [first, first])
+        self.assertEqual(p2p_changes(listing, inbox), [first])
+        late = Watch(backend, guest.call, inbox)
+        await settle()
+        self.assertEqual(p2p_changes(late, inbox), [first])
+        read = Msg(backend.gamesync_read_documents(guest.call, Msg(encode((1, inbox))))).get_msgs(1)[0].get_msg(1)
+        listed = Msg(backend.gamesync_list_documents(guest.call, Msg(encode((1, "docs/__pgn/All/__stu"))))).get_msgs(1)
+        self.assertEqual([document.get_str(1) for document in listed], [inbox])
+        for fields in [read_fields(backend, guest, inbox), server.map_entries(read.get_bytes(2)),
+                       server.map_entries(listed[0].get_bytes(2))]:
+            self.assertEqual(p2p_shown(fields), (1, SHOWN_RELAY))
+        masked = Msg(backend.gamesync_get_document(guest.call, Msg(encode((1, inbox), (2, encode((1, "mp.i")))))))
+        self.assertEqual(server.map_entries(masked.get_bytes(2)), {"mp": map_value({"i": encode((3, 1))})})
+
+        # The later messages follow on. Written again, a message is shown again under the same index;
+        # those without a relay candidate are withheld too.
+        for index, candidate in [(4, RELAY_CANDIDATE), (4, RELAY_CANDIDATE), (5, HOST_CANDIDATE),
+                                 (6, SRFLX_CANDIDATE), (7, RELAY_CANDIDATE)]:
+            send(backend, host_player, inbox, p2p_message(index, candidate))
+        await settle()
+        self.assertEqual(p2p_changes(late, inbox), [first, (UPDATED, 2, SHOWN_RELAY), (UPDATED, 2, SHOWN_RELAY),
+                                                    (UPDATED, 3, SHOWN_RELAY)])
+        self.assertEqual(p2p_shown(read_fields(backend, host_player, inbox)), (3, SHOWN_RELAY))
+        self.assertEqual(server.doc_entries(island.gamesync.docs[inbox]), p2p_message(7, RELAY_CANDIDATE))  # as written
+        for watch in (watching, listing, late):
+            await watch.close()
+            self.assertIsNone(watch.error)
+
+    def test_withheld_messages_count_across_commits_deletions_and_restarts(self) -> None:
+        asyncio.run(self.withheld_messages_count_across_commits_deletions_and_restarts())
+
+    async def withheld_messages_count_across_commits_deletions_and_restarts(self) -> None:
+        backend = self.relay_backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        inbox = f"docs/__pgn/All/__stu/{guest.id}"
+        watching = Watch(backend, guest.call, inbox)
+        await settle()
+        # Written in the same commit as the relay candidate, the host candidate is withheld all the same.
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE), p2p_message(2, RELAY_CANDIDATE))
+        # The receiver may delete its inbox between messages; the numbering goes on.
+        delete(backend, guest, inbox)
+        send(backend, host_player, inbox, p2p_message(3, RELAY_CANDIDATE))
+        delete(backend, guest, inbox)
+        # Deleting an inbox that holds only a withheld message announces nothing.
+        send(backend, host_player, inbox, p2p_message(4, HOST_CANDIDATE))
+        delete(backend, guest, inbox)
+        send(backend, host_player, inbox, p2p_message(5, RELAY_CANDIDATE))
+        # A sender that numbers its messages anew is shown from the first again.
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE))
+        send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE))
+        await settle()
+        self.assertEqual(p2p_changes(watching, inbox), [
+            (EXIST, 1, SHOWN_RELAY), (DELETED,), (EXIST, 2, SHOWN_RELAY), (DELETED,), (EXIST, 3, SHOWN_RELAY),
+            (UPDATED, 1, SHOWN_RELAY)])
+        await watching.close()
+        self.assertIsNone(watching.error)
+
+    def test_writes_leaving_a_message_as_it_was_keep_its_numbering(self) -> None:
+        asyncio.run(self.writes_leaving_a_message_as_it_was_keep_its_numbering())
+
+    async def writes_leaving_a_message_as_it_was_keep_its_numbering(self) -> None:
+        backend = self.relay_backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        inbox = f"docs/__pgn/All/__stu/{guest.id}"
+        watching = Watch(backend, guest.call, inbox)
+        await settle()
+        # The receiver writes other fields of its inbox: it merges nothing, replaces one field alone
+        # and transforms one.
+        receiver_writes = [merge(inbox, {}), masked_update(inbox, {"ack": encode((2, True))}, "ack"),
+                           transform(inbox, encode((1, "n"), (3, encode((3, 1)))))]
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE))
+        for write in receiver_writes:
+            backend.gamesync_write_documents(guest.call, Msg(encode((1, write))))
+        await settle()
+        # None of them shows the withheld message,
+        self.assertEqual(p2p_changes(watching, inbox), [])
+        self.assert_status(server.NOT_FOUND, backend.gamesync_get_document, guest.call, encode((1, inbox)))
+        # nor, once the relay candidate is shown as the first message, another index for it.
+        send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE))
+        for write in receiver_writes:
+            backend.gamesync_write_documents(guest.call, Msg(encode((1, write))))
+        send(backend, host_player, inbox, p2p_message(3, RELAY_CANDIDATE))
+        await settle()
+        self.assertEqual([change[:2] for change in p2p_changes(watching, inbox)],
+                         [(EXIST, 1), (UPDATED, 1), (UPDATED, 1), (UPDATED, 1), (UPDATED, 2)])
+        # Nor once the host has left and its streams are forgotten.
+        host(backend, "u-host")
+        await settle()
+        for write in receiver_writes:
+            backend.gamesync_write_documents(guest.call, Msg(encode((1, write))))
+        await settle()
+        self.assertEqual([change[:2] for change in p2p_changes(watching, inbox)][5:], [(UPDATED, 2)] * 3)
+        self.assertEqual(island.gamesync.streams, {})
+        await watching.close()
+        self.assertIsNone(watching.error)
+
+    def test_each_sender_is_numbered_on_its_own(self) -> None:
+        asyncio.run(self.each_sender_is_numbered_on_its_own())
+
+    async def each_sender_is_numbered_on_its_own(self) -> None:
+        backend = self.relay_backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        other = join(backend, island, "u-other")
+        inbox = f"docs/__pgn/All/__stu/{guest.id}"
+        watching = Watch(backend, guest.call, inbox)
+        await settle()
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE, host_player.id))
+        send(backend, other, inbox, p2p_message(1, RELAY_CANDIDATE, other.id))  # nothing withheld: as written
+        send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE, host_player.id))
+        send(backend, other, inbox, p2p_message(2, RELAY_CANDIDATE, other.id))
+        # Neither another player writing the host's sender ids nor the host over another connection
+        # continues the host's numbering; the host over the same connection does.
+        send(backend, other, inbox, p2p_message(3, RELAY_CANDIDATE, host_player.id))
+        send(backend, host_player, inbox, p2p_message(3, RELAY_CANDIDATE, host_player.id, connection=8))
+        send(backend, host_player, inbox, p2p_message(3, RELAY_CANDIDATE, host_player.id))
+        await settle()
+        self.assertEqual([change[:2] for change in p2p_changes(watching, inbox)],
+                         [(EXIST, 1), (UPDATED, 1), (UPDATED, 2), (UPDATED, 3), (UPDATED, 3), (UPDATED, 2)])
+
+        # Nor does a game session numbering another's documents of the same name and sender.
+        island_b, host_b = host(backend, "u-host-b")
+        guest_b = join(backend, island_b, "u-guest-b")
+        send(backend, host_b, inbox, p2p_message(3, RELAY_CANDIDATE, host_player.id))
+        self.assertEqual(p2p_shown(read_fields(backend, guest_b, inbox)), (3, SHOWN_RELAY))
+        await watching.close()
+        self.assertIsNone(watching.error)
+
+    def test_default_setup_shows_every_p2p_message(self) -> None:
+        asyncio.run(self.default_setup_shows_every_p2p_message())
+
+    async def default_setup_shows_every_p2p_message(self) -> None:
+        backend = self.backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        inbox = f"docs/__pgn/All/__stu/{guest.id}"
+        watching = Watch(backend, guest.call, inbox)
+        await settle()
+        send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE))
+        send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE))
+        await settle()
+        self.assertEqual([(kind, fields) for kind, document, fields in watching.changes() if document == inbox],
+                         [(EXIST, p2p_message(1, HOST_CANDIDATE)), (UPDATED, p2p_message(2, RELAY_CANDIDATE))])
+        await watching.close()
+
+    def test_p2p_streams_are_bounded_and_forgotten(self) -> None:
+        asyncio.run(self.p2p_streams_are_bounded_and_forgotten())
+
+    async def p2p_streams_are_bounded_and_forgotten(self) -> None:
+        backend = self.relay_backend()
+        island, host_player = host(backend, "u-host")
+        guest = join(backend, island, "u-guest")
+        other = join(backend, island, "u-other")
+        space = island.gamesync
+        inbox, other_inbox = f"docs/__pgn/All/__stu/{guest.id}", f"docs/__pgn/All/__stu/{other.id}"
+        watching = Watch(backend, guest.call, inbox)
+        await settle()
+
+        # A player numbers so many streams at once: a write that would start another fails and changes
+        # nothing, while its other streams, and other players', go on with their numbering.
+        send(backend, other, inbox, p2p_message(1, HOST_CANDIDATE, other.id))
+        with mock.patch.object(server, "MAX_SIGNALING_STREAMS_PER_WRITER", 2):
+            for connection in (1, 2):
+                send(backend, host_player, inbox, p2p_message(1, HOST_CANDIDATE, connection=connection))
+            self.assert_status(server.RESOURCE_EXHAUSTED, backend.gamesync_write_documents, host_player.call,
+                               encode((1, update(inbox, p2p_message(1, HOST_CANDIDATE, connection=3)))))
+            send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE, connection=1))
+            send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE, connection=3))  # nothing withheld
+            send(backend, host_player, inbox, p2p_message(2, RELAY_CANDIDATE, connection=2))
+            send(backend, other, inbox, p2p_message(2, RELAY_CANDIDATE, other.id))
+        await settle()
+        self.assertEqual([change[:2] for change in p2p_changes(watching, inbox)],
+                         [(EXIST, 1), (UPDATED, 2), (UPDATED, 1), (UPDATED, 1)])
+
+        # What players are shown in place of the stored version counts against the Gamesync limit,
+        # and a commit over it changes nothing, the numbering included.
+        send(backend, host_player, other_inbox, p2p_message(1, RELAY_CANDIDATE, connection=9))
+        size, _ = server.gamesync_size(space.docs, space.globals, space.deferments, space.queue,
+                                       [doc for doc in space.published.values() if doc is not None])
+        with mock.patch.object(server, "MAX_GAMESYNC_BYTES", size + 64):
+            self.assert_status(server.RESOURCE_EXHAUSTED, backend.gamesync_write_documents, host_player.call,
+                               encode((1, update(other_inbox, p2p_message(2, HOST_CANDIDATE, connection=9)))))
+        self.assertEqual(p2p_shown(read_fields(backend, other, other_inbox)), (1, SHOWN_RELAY))
+        send(backend, host_player, other_inbox, p2p_message(3, RELAY_CANDIDATE, connection=9))
+        self.assertEqual(p2p_shown(read_fields(backend, other, other_inbox)), (3, SHOWN_RELAY))
+
+        # A player who leaves takes along the streams it writes and those written to its inbox.
+        send(backend, other, inbox, p2p_message(3, HOST_CANDIDATE, other.id))
+        send(backend, host_player, other_inbox, p2p_message(4, HOST_CANDIDATE, connection=9))
+        self.assertTrue(any(key[1] == other.user_session for key in space.streams))
+        self.assertTrue(any(key[0] == other_inbox for key in space.streams))
+        host(backend, "u-other")
+        await settle()
+        self.assertEqual([key for key in space.streams if other.user_session == key[1] or key[0] == other_inbox], [])
+        self.assertNotIn(other_inbox, space.published)
+
+        # A game session dropped with its last player keeps nothing of them.
+        await watching.close()
+        host(backend, "u-host")
+        host(backend, "u-guest")
+        await settle()
+        self.assertNotIn(island.name, backend.sessions)
+        self.assertEqual((space.docs, space.published, space.renumbered, space.streams), ({}, {}, {}, {}))
 
     def test_turn_settings(self) -> None:
         secret_file = Path(self.directory.name) / "turn-secret"
