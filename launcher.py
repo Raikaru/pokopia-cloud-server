@@ -909,6 +909,58 @@ def find_emulator(given: Path | None, settings: dict) -> Path:
     return candidate.resolve()
 
 
+def choose_play_emulator(home: Path, given: Path | None, settings: dict) -> Path:
+    """Use a compatible emulator or offer to obtain the public private-server build."""
+    saved = Path(settings["emulator"]) if settings.get("emulator") else None
+    bundled = program_dir() / EMULATOR_NAME
+    candidate = given or (saved if saved is not None and saved.is_file() else None)
+    if candidate is None and bundled.is_file():
+        candidate = bundled
+    if candidate is None and ask("Do you already have an Eglantine build with private-server support?"):
+        try:
+            candidate = find_emulator(None, {})
+        except SystemExit as exc:
+            print(exc)
+    if candidate is not None:
+        candidate = find_emulator(candidate, settings)
+        try:
+            check_emulator(candidate)
+            return candidate
+        except SystemExit as exc:
+            print(exc)
+
+    print("Djihads80's upstream Eglantine does not include the private-server integration. "
+          "notsapinho's Eglantine builds are checked for that support before installation.")
+    if not ask("Download a compatible build from https://github.com/notsapinho/Eglantine/releases?"):
+        sys.exit("A compatible emulator is required. Select one or obtain a build from "
+                 "https://github.com/notsapinho/Eglantine/releases.")
+    from emulator_download import download_emulator
+    replacement = download_emulator(home, check_emulator)
+    reuse_portable_profile(candidate, replacement)
+    return replacement
+
+
+def reuse_portable_profile(previous: Path | None, replacement: Path) -> None:
+    """Keep a selected portable profile when switching executables, without copying its data."""
+    if previous is None:
+        return
+    original = emulator_directory(previous) / "user"
+    if not original.is_dir():
+        return
+    target = emulator_directory(replacement) / "user"
+    try:
+        if target.exists() or target.is_symlink():
+            if not target.samefile(original):
+                sys.exit(f"{target} already points to a different profile; it was left unchanged. "
+                         f"Choose a compatible emulator that uses {original} instead.")
+        else:
+            target.symlink_to(original.resolve(), target_is_directory=True)
+    except OSError as exc:
+        sys.exit(f"Cannot link the downloaded emulator to your existing portable profile {original}: {exc}. "
+                 "Your profile was not changed. Choose a compatible emulator that already uses it.")
+    print(f"Using your existing portable emulator profile: {original}")
+
+
 def find_game(given: Path | None, settings: dict) -> Path | None:
     """--game, else the one used last time, else one the tester chooses; None opens the emulator
     without starting a game."""
@@ -947,6 +999,8 @@ def emulator_profile(exe: Path) -> tuple[Path, Path]:
 def play(args: argparse.Namespace) -> None:
     home: Path = args.home
     make_home(home)
+    settings = load_settings(home)
+    emulator = choose_play_emulator(home, args.emulator, settings)
     config = read_config(home)
     if config is None:
         print("This PC is not linked to an account yet. In the browser window that opens, sign in (or "
@@ -966,9 +1020,6 @@ def play(args: argparse.Namespace) -> None:
             sys.exit(f"The server still does not accept this PC: {reason}. Ask the operator whether your "
                      f"account is enabled.")
 
-    settings = load_settings(home)
-    emulator = find_emulator(args.emulator, settings)
-    check_emulator(emulator)
     if emulator_running(emulator):
         sys.exit(f"Close the emulator ({emulator}) first, then start the launcher again: the emulator "
                  f"saves its settings when it exits, which would undo the launcher's changes.")

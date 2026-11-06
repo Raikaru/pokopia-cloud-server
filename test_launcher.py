@@ -140,6 +140,30 @@ class ExistingProfileTest(unittest.TestCase):
             self.assertEqual(config, (data / "config" if os.name == "nt" else root / "config" / "eden"))
             self.assertFalse((exe.parent / "user").exists())
 
+    @unittest.skipIf(os.name == "nt", "Windows may not permit creating unprivileged symbolic links")
+    def test_replacement_reuses_portable_saves_without_copying(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, new = root / "old" / "eglantine", root / "new" / "eglantine"
+            (old.parent / "user").mkdir(parents=True)
+            new.parent.mkdir()
+            (old.parent / "user" / "save.bin").write_bytes(b"progress")
+            launcher.reuse_portable_profile(old, new)
+            profile, _ = launcher.emulator_profile(new)
+            self.assertTrue(profile.samefile(old.parent / "user"))
+            self.assertEqual((profile / "save.bin").read_bytes(), b"progress")
+
+    def test_replacement_never_overwrites_another_portable_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old, new = root / "old" / "eglantine", root / "new" / "eglantine"
+            (old.parent / "user").mkdir(parents=True)
+            (new.parent / "user").mkdir(parents=True)
+            (new.parent / "user" / "save.bin").write_bytes(b"other profile")
+            with self.assertRaisesRegex(SystemExit, "different profile"):
+                launcher.reuse_portable_profile(old, new)
+            self.assertEqual((new.parent / "user" / "save.bin").read_bytes(), b"other profile")
+
 
 class MacBundleTest(unittest.TestCase):
     def test_finds_bundle_and_keeps_profile_outside_it(self) -> None:

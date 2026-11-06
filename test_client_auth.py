@@ -82,8 +82,8 @@ class Account:
         context = server.encode_map({"password": text(password)}) if password is not None else None
         return Msg(self.backend.get_document(self.call(), Msg(encode((1, name), (3, context)))))
 
-    def host(self, password: str = PASSWORD) -> server.GameSession:
-        properties = server.encode_map({"string1": text(SESSION_ID)})
+    def host(self, password: str = PASSWORD, session_id: str = SESSION_ID) -> server.GameSession:
+        properties = server.encode_map({"string1": text(session_id)})
         ticket_request = encode((2, "tenants/current/matchmakingConfigs/MatchmakingConfigsDefault"),
                                 (3, encode((1, "tenants/current/users/current"))),
                                 (6, encode((6, password), (11, properties))))
@@ -478,6 +478,60 @@ class ClientAuthTest(unittest.TestCase):
 
     # Matchmaking
 
+    def test_town_link_code_grants_only_the_searching_account_session_access(self) -> None:
+        session = self.host.host(session_id=":ABC123")
+        self.assertEqual(session.island, "")
+        other = Account(self.backend, "acct-other", "192.0.2.3")
+        self.assert_status(server.NOT_FOUND, self.guest.join, session, PASSWORD)
+        self.assertEqual(self.guest.query(":WRONG1"), [])
+        found = self.guest.query(":ABC123")
+        self.assertEqual([entry.get_str(1) for entry in found], [session.name])
+        self.assertEqual(found[0].get_str(6), "")
+        self.assert_status(server.NOT_FOUND, other.join, session, PASSWORD)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.get,
+                           f"{self.host.documents}/private/StageData")
+        self.assert_status(server.PERMISSION_DENIED, self.guest.join, session, "WRONG0")
+        self.guest.join(session, PASSWORD)
+        self.assertIn(self.guest.user, session.user_sessions)
+
+    def test_town_code_grant_expires_and_ends_when_code_changes(self) -> None:
+        session = self.host.host(session_id=":ABC123")
+        self.assertEqual(len(self.guest.query(":ABC123")), 1)
+        session.properties_raw = server.encode_map({"string1": text(":NEW123")})
+        self.assert_status(server.NOT_FOUND, self.guest.join, session, PASSWORD)
+        self.assertEqual(len(self.guest.query(":NEW123")), 1)
+        with mock.patch.object(server.time, "monotonic",
+                               return_value=server.time.monotonic() + server.PASSWORD_GRANT_SECONDS + 1):
+            self.assert_status(server.NOT_FOUND, self.guest.join, session, PASSWORD)
+
+    def test_short_island_session_id_does_not_bypass_island_password(self) -> None:
+        self.host.commit(update(f"{self.host.documents}/private/SessionIDData",
+                                {"sessionID": text("ABC123")}))
+        session = self.host.host(session_id=":ABC123")
+        self.assertEqual(session.island, self.host.user)
+        self.assertEqual(self.guest.query(":ABC123"), [])
+        self.assert_status(server.NOT_FOUND, self.guest.join, session, PASSWORD)
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        for _ in range(server.GUESS_LIMITS["account"][0] + 1):
+            self.assertEqual([item.get_str(1) for item in self.guest.query(":ABC123")],
+                             [session.name])
+        self.guest.join(session, PASSWORD)
+
+    def test_late_island_association_revokes_town_code_visibility(self) -> None:
+        session = self.host.host(session_id=":ABC123")
+        self.assertEqual(len(self.guest.query(":ABC123")), 1)
+        self.host.commit(update(f"{self.host.documents}/private/SessionIDData",
+                                {"sessionID": text("ABC123")}))
+        self.assertEqual(session.island, "")
+        self.assertEqual(self.guest.query(":ABC123"), [])
+        self.assert_status(server.NOT_FOUND, self.guest.join, session, PASSWORD)
+
+    def test_town_code_guesses_are_rate_limited(self) -> None:
+        self.host.host(session_id=":ABC123")
+        for _ in range(server.GUESS_LIMITS["account"][0]):
+            self.assertEqual(self.guest.query(":WRONG1"), [])
+        self.assert_status(server.RESOURCE_EXHAUSTED, self.guest.query, ":ABC123")
+
     def test_session_needs_island_password_to_be_found_and_joined(self) -> None:
         session = self.host.host()
         self.assertEqual(len(self.host.query()), 1)
@@ -577,9 +631,8 @@ class ClientAuthTest(unittest.TestCase):
         finally:
             file.close()
 
-    def test_transferred_host_cannot_overwrite_island(self) -> None:
-        # Until current-host authorization is available, even the transferred host must not save
-        # another account's island; it can still read the island after the grant expires.
+    def test_sole_guest_takes_over_after_owner_leaves(self) -> None:
+        # With the owner gone, the one remaining authorized guest can save the island.
         stage = f"{self.host.documents}/private/StageData"
         self.host.commit(encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{self.complete_upload()}")))))
         session = self.join_island()
@@ -591,9 +644,42 @@ class ClientAuthTest(unittest.TestCase):
         with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
             self.assertEqual(self.guest.get(stage).get_str(1), stage)
             self.assertEqual(self.download_stage(self.guest), b"island")
-            self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save,
+            self.guest.commit(*save, context=island_context(PASSWORD))
+        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
+
+    def test_expired_host_is_pruned_before_the_sole_guest_saves(self) -> None:
+        session = self.join_island()
+        session.user_sessions[self.host.user].last_seen -= (server.USER_SESSION_GRACE_SECONDS + 1) * 1_000_000_000
+        self.guest.commit(*self.island_save(self.guest_upload()), context=island_context(PASSWORD))
+        self.assertNotIn(self.host.user, session.user_sessions)
+        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
+
+    def test_expired_host_is_pruned_before_sole_guest_publishes_host(self) -> None:
+        session = self.join_island()
+        calls = []
+        for account in (self.host, self.guest):
+            member = session.user_sessions[account.user]
+            self.backend.gamesync_join(session, member)
+            token = Msg(self.backend.encode_gamesync_token(account.call(), account.user, member.name)).get_msg(1).get_str(2)
+            calls.append((account.call(token), member))
+        doc = "docs/ktglol/sys"
+        initial = update(doc, {"h_sid": encode((3, calls[0][1].ussid)), "h_uid": encode((3, 101))})
+        self.backend.gamesync_write_documents(calls[0][0], Msg(encode((1, initial))))
+        calls[0][1].last_seen -= (server.USER_SESSION_GRACE_SECONDS + 1) * 1_000_000_000
+        elected = update(doc, {"h_sid": encode((3, calls[1][1].ussid)), "h_uid": encode((3, 202))})
+        self.backend.gamesync_write_documents(calls[1][0], Msg(encode((1, elected))))
+        self.assertEqual(session.host_session, calls[1][1].name)
+
+    def test_multiple_guests_cannot_claim_a_departed_hosts_save(self) -> None:
+        session = self.join_island()
+        other = Account(self.backend, "acct-other", "192.0.2.1")
+        other.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        other.join(session, PASSWORD)
+        self.backend.drop_user_session(session, self.host.user)
+        stage = f"{self.host.documents}/private/StageData"
+        for account in (self.guest, other):
+            self.assert_status(server.PERMISSION_DENIED, account.commit, update(stage, {}),
                                context=island_context(PASSWORD))
-        self.assertEqual(self.download_stage(self.host), b"island")
 
     def test_visitor_hosts_the_island_while_the_owner_is_away(self) -> None:
         stage = f"{self.host.documents}/private/StageData"
@@ -609,9 +695,184 @@ class ClientAuthTest(unittest.TestCase):
         self.assertEqual([entry.get_str(1) for entry in other.query()], [session.name])
         other.join(session, PASSWORD)
         self.assertEqual([entry.get_str(1) for entry in self.host.query()], [session.name])
+        save = self.island_save(self.guest_upload())
         with mock.patch.object(server.time, "monotonic", return_value=self.grant_expired()):
-            self.assert_status(server.PERMISSION_DENIED, self.guest.commit,
-                               *self.island_save(self.guest_upload()), context=island_context(PASSWORD))
+            # The creator is the real host of this session; another joined visitor is not.
+            self.assert_status(server.PERMISSION_DENIED, other.commit, save[0],
+                               context=island_context(PASSWORD))
+            self.guest.commit(*save, context=island_context(PASSWORD))
+            self.assertEqual(self.download_stage(other), b"saved by the guest")
+        self.backend.drop_user_session(session, self.guest.user)
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, save[0],
+                           context=island_context(PASSWORD))
+        other.commit(save[0], context=island_context(PASSWORD))
+
+    def test_island_owner_cannot_overwrite_a_visiting_hosts_save(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        metadata = f"{self.host.documents}/public/MetaData"
+        initial = self.complete_upload()
+        self.host.commit(encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{initial}")))))
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        session = self.guest.host()
+        self.host.join(session, PASSWORD)
+        original = self.download_stage(self.host)
+        owner_upload = self.complete_upload()
+        operations = (
+            update(stage, {"changed": text("owner")}),
+            update(metadata, {"changed": text("owner")}),
+            encode((2, encode((1, stage)))),
+            encode((6, encode((1, stage), (2, encode((1, "changed"), (2, 1)))))),
+            encode((3, encode((1, stage), (2, b"owner"), (4, "application/octet-stream")))),
+            encode((4, encode((1, stage)))),
+            encode((5, encode((1, stage), (2, f"https://storage.invalid/upload/{owner_upload}")))),
+        )
+        for index, operation in enumerate(operations):
+            with self.subTest(operation=index):
+                self.assert_status(server.PERMISSION_DENIED, self.host.commit, operation)
+        self.assertEqual(self.download_stage(self.host), original)
+        self.guest.commit(*self.island_save(self.guest_upload()), context=island_context(PASSWORD))
+        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
+        self.backend.drop_user_session(session, self.host.user)
+        self.assert_status(server.PERMISSION_DENIED, self.host.commit, operations[0])
+        self.host.commit(update(f"{self.host.documents}/private/SessionIDData", {"sessionID": text("CHANGED")}))
+        self.assert_status(server.PERMISSION_DENIED, self.host.commit, operations[0])
+        self.backend.drop_user_session(session, self.guest.user)
+        self.host.commit(operations[0])
+
+    def test_another_profile_on_the_hosts_account_is_not_the_host(self) -> None:
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.guest.host()
+        other = Account(self.backend, "acct-guest", "203.0.113.1", profile="other-profile")
+        stage = f"{self.host.documents}/private/StageData"
+        self.assert_status(server.PERMISSION_DENIED, other.commit, update(stage, {"changed": text("other")}),
+                           context=island_context(PASSWORD))
+        self.guest.commit(*self.island_save(self.guest_upload()), context=island_context(PASSWORD))
+        self.assertEqual(self.download_stage(self.host), b"saved by the guest")
+
+    def test_host_grant_moves_island_save_authority(self) -> None:
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        session = self.guest.host()
+        other = Account(self.backend, "acct-other", "192.0.2.1")
+        other.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        other.join(session, PASSWORD)
+
+        def gamesync(account: Account) -> tuple[server.Call, int]:
+            member = session.user_sessions[account.user]
+            self.backend.gamesync_join(session, member)
+            token = Msg(self.backend.encode_gamesync_token(account.call(), account.user, member.name)).get_msg(1).get_str(2)
+            name = server.GAMESYNC_USER_SESSION_DOCS + member.name.rpartition("/")[2]
+            ussid = Msg(server.doc_entries(session.gamesync.docs[name])["ussid"]).get_int(3)
+            return account.call(token), ussid
+
+        host_call, host_sid = gamesync(self.guest)
+        other_call, other_sid = gamesync(other)
+        doc = "docs/ktglol/sys"
+        initial = update(doc, {"h_sid": encode((3, host_sid)), "h_uid": encode((3, 101))})
+        transfer = update(doc, {"h_sid": encode((3, other_sid)), "h_uid": encode((3, 202))})
+        self.backend.gamesync_write_documents(host_call, Msg(encode((1, initial))))
+        self.assert_status(server.PERMISSION_DENIED, self.backend.gamesync_write_documents,
+                           other_call, Msg(encode((1, transfer))))
+        # Alternate write paths and forged server-issued identity must not bypass host authority.
+        self.assert_status(server.PERMISSION_DENIED, self.backend.gamesync_lazy_write_documents,
+                           other_call, Msg(encode((1, transfer))))
+        tx = Msg(self.backend.gamesync_begin_transaction(other_call, Msg())).get_bytes(1)
+        self.assert_status(server.PERMISSION_DENIED, self.backend.gamesync_commit_transaction,
+                           other_call, Msg(encode((1, transfer), (3, tx))))
+        host_member = session.user_sessions[self.guest.user]
+        presence = server.GAMESYNC_USER_SESSION_DOCS + host_member.name.rpartition("/")[2]
+        self.assert_status(server.PERMISSION_DENIED, self.backend.gamesync_write_documents,
+                           other_call, Msg(encode((1, update(presence, {"ussid": encode((3, other_sid))})))))
+        deferred = encode((1, "userSessions/current/deferments/forged"), (2, transfer))
+        self.backend.gamesync_write_documents(other_call, Msg(encode((2, encode((1, encode((1, deferred))))))))
+        self.backend.gamesync_fire_deferments(session, session.user_sessions[other.user].name)
+        self.assertEqual(session.host_session, host_member.name)
+        self.backend.gamesync_write_documents(host_call, Msg(encode((1, transfer))))
+        self.assert_status(server.PERMISSION_DENIED, self.backend.gamesync_write_documents,
+                           host_call, Msg(encode((1, initial))))
+
+        stage = f"{self.host.documents}/private/StageData"
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}),
+                           context=island_context(PASSWORD))
+        upload_id = self.storage.new_upload(other.principal.account)
+        self.storage.handle("PUT", f"/upload/{upload_id}", {}, b"new host's island", other.principal)
+        other.commit(*self.island_save(upload_id), context=island_context(PASSWORD))
+        self.assertEqual(self.download_stage(self.host), b"new host's island")
+
+    def test_visitor_host_save_requires_current_password_and_session(self) -> None:
+        stage = f"{self.host.documents}/private/StageData"
+        password_doc = f"{self.host.documents}/private/PasswordData"
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.guest.host()
+        save = self.island_save(self.guest_upload())
+        original = self.store.documents[stage]
+        wrong_session = server.encode_map({"sessionID": text("NOT-THE-ISLAND"), "password": text(PASSWORD)})
+        for context in (None, wrong_session, island_context("WRONG0")):
+            with self.subTest(context=context):
+                self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save, context=context)
+        # A permitted operation cannot smuggle a different document into the same commit.
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, save[0],
+                           update(password_doc, {"password": text("HIJACK")}),
+                           context=island_context(PASSWORD))
+        self.assertEqual(self.store.documents[stage], original)
+        self.host.commit(update(password_doc, {"password": text("NEW123")}))
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, *save,
+                           context=island_context("NEW123"))
+
+    def test_visitor_host_import_transfers_quota_without_new_global_blob_usage(self) -> None:
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.guest.host()
+        save = self.island_save(self.guest_upload(b"x" * 100))
+        self.storage.max_bytes = sum(self.storage.usage())
+        self.guest.commit(*save, context=island_context(PASSWORD))
+        self.assertEqual(self.storage.usage(self.host.principal.account)[1], 100)
+        self.assertEqual(self.storage.usage(self.guest.principal.account)[1], 0)
+
+    def test_cannot_create_a_second_session_for_an_active_island(self) -> None:
+        session = self.host.host()
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assert_status(server.ALREADY_EXISTS, self.guest.host)
+        self.guest.join(session, PASSWORD)
+
+    def test_unrecognized_owner_session_also_blocks_duplicate_host(self) -> None:
+        session_doc = f"{self.host.documents}/private/SessionIDData"
+        self.host.commit(update(session_doc, {"sessionID": text("OLD-ID")}))
+        original = self.host.host()
+        self.assertEqual(original.island, "")
+        self.host.commit(update(session_doc, {"sessionID": text(SESSION_ID[1:])}))
+        self.guest.get(session_doc, PASSWORD)
+        self.assert_status(server.ALREADY_EXISTS, self.guest.host)
+
+    def test_strangers_unassociated_session_does_not_block_owner(self) -> None:
+        stranger = Account(self.backend, "acct-stranger", "192.0.2.7")
+        self.assertEqual(stranger.host().island, "")
+        self.assertEqual(self.host.host().island, self.host.user)
+
+    def test_ambiguous_island_ids_cannot_claim_host_authority(self) -> None:
+        self.guest.commit(update(f"{self.guest.documents}/private/SessionIDData",
+                                 {"sessionID": text(SESSION_ID[1:])}))
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        self.assert_status(server.FAILED_PRECONDITION, self.guest.host)
+
+    def test_rejoined_creator_does_not_recover_host_authority(self) -> None:
+        self.guest.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        session = self.guest.host()
+        other = Account(self.backend, "acct-other", "192.0.2.1")
+        other.get(f"{self.host.documents}/private/SessionIDData", PASSWORD)
+        other.join(session, PASSWORD)
+        self.backend.drop_user_session(session, self.guest.user)
+        self.guest.join(session, PASSWORD)
+        stage = f"{self.host.documents}/private/StageData"
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit, update(stage, {}),
+                           context=island_context(PASSWORD))
+
+    def test_changed_island_id_fences_the_old_session(self) -> None:
+        session_doc = f"{self.host.documents}/private/SessionIDData"
+        self.guest.get(session_doc, PASSWORD)
+        self.guest.host()
+        self.host.commit(update(session_doc, {"sessionID": text("NEW-ID")}))
+        new_context = server.encode_map({"sessionID": text("NEW-ID"), "password": text(PASSWORD)})
+        self.assert_status(server.PERMISSION_DENIED, self.guest.commit,
+                           update(f"{self.host.documents}/private/StageData", {}), context=new_context)
 
     def test_a_session_only_hosts_an_island_its_creator_may_open(self) -> None:
         # The stranger names the island's session id without having given the island password.
@@ -1132,6 +1393,8 @@ class GamesyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         member = next(member for member in self.island.user_sessions.values()
                       if member.name == self.host_session)
         self.backend.gamesync_join(self.island, member)
+        # An unassociated session does not enforce island-host presence fields.
+        self.island.island = ""
         name = server.GAMESYNC_USER_SESSION_DOCS + self.host_session.rpartition('/')[2]
         self.backend.gamesync_write_documents(
             self.host_call, Msg(encode((1, update(name, {'ussid': b'\x0f'})))))

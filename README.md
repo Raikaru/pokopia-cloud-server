@@ -7,7 +7,7 @@ A self-hosted replacement for the NPLN services used by Pokémon Pokopia's Cloud
 ## Requirements
 
 - Python 3.10 or newer and OpenSSL.
-- A compatible [Eglantine Online](https://github.com/Raikaru/Eglantine-Online) build with private-server support.
+- A compatible [notsapinho/Eglantine](https://github.com/notsapinho/Eglantine/releases) build with private-server support. The launcher offers to download one when needed and checks the executable before using it.
 - Your own game, decryption keys and any required firmware.
 - For public hosting: a domain, HTTPS, and the account portal and launcher dependencies.
 
@@ -25,7 +25,7 @@ python -m venv .venv
 
 ## Security
 
-- The initial public-source release (`ce74229`) and later versions before `01f0a33` allowed any island member with its password to overwrite the island save. Update and restart if running one of those versions. The current server denies guest-hosted saves until host authorization can be verified.
+- Some deployed versions allow any island member with the island password to overwrite its save. Check the running server, not just its version label, before allowing multiple players; the host-authority changes in this working tree are not automatically deployed. Guest-hosted saves remain experimental: isolated tests verified host transfer, guest save/reopen, and another guest joining while the owner was away; multiple-guest host transfer and separate-network play remain unverified. See the [hosting limits](docs/server-operations.md#what-the-server-enforces).
 - Without client-certificate authentication the server **does not authenticate users**. Keep it on loopback or a trusted network; use client-certificate mode for public hosting.
 - Players' IP addresses can be exposed without relay-only mode. See the guide's [relay and security limitations](docs/server-operations.md#security-limitations).
 - Keep certificates' private keys, account databases, `data/`, backups and logs private. The data directory contains a signing secret; verbose logs can contain tokens and player information.
